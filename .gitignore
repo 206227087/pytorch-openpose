@@ -6,3 +6,6 @@ hiddenlayer/
 __pycache__
 *.prototxt
 videos/
+data/
+preprocessed/
+runs/
