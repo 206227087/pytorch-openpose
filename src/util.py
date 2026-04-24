@@ -101,7 +101,11 @@ def draw_handpose(canvas, all_hand_peaks, show_number=False):
             if show_number:
                 ax.text(x, y, str(i))
     bg.draw()
-    canvas = np.fromstring(bg.tostring_rgb(), dtype='uint8').reshape(int(height), int(width), 3)
+    fig.canvas.draw()
+    image = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+    image = image.reshape(fig.canvas.get_width_height()[::-1] + (4,))
+    image = image[:, :, :3]  # 去掉 Alpha 通道，只保留 RGB
+    image = image[:, :, ::-1]  # 如果需要转为 BGR (OpenCV 格式)
     return canvas
 
 # image drawed by opencv is not good.

@@ -16,8 +16,17 @@ class Body(object):
         self.model = bodypose_model()
         if torch.cuda.is_available():
             self.model = self.model.cuda()
-        model_dict = util.transfer(self.model, torch.load(model_path))
-        self.model.load_state_dict(model_dict)
+        try:
+            state_dict = torch.load(model_path, map_location='cpu')
+            # 检查键名是否匹配，如果不匹配再走 transfer 逻辑
+            if list(self.model.state_dict().keys()) == list(state_dict.keys()):
+                self.model.load_state_dict(state_dict)
+            else:
+                print("Keys mismatch, trying to transfer weights...")
+                model_dict = util.transfer(self.model, state_dict)
+                self.model.load_state_dict(model_dict)
+        except Exception as e:
+            print(f"Error loading model: {e}")
         self.model.eval()
 
     def __call__(self, oriImg):
@@ -36,7 +45,7 @@ class Body(object):
             scale = multiplier[m]
             imageToTest = cv2.resize(oriImg, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
             imageToTest_padded, pad = util.padRightDownCorner(imageToTest, stride, padValue)
-            im = np.transpose(np.float32(imageToTest_padded[:, :, :, np.newaxis]), (3, 2, 0, 1)) / 256 - 0.5
+            im = np.transpose(np.float32(imageToTest_padded[:, :, :, np.newaxis]), (3, 2, 0, 1)) / 255 - 0.5
             im = np.ascontiguousarray(im)
 
             data = torch.from_numpy(im).float()
@@ -45,6 +54,10 @@ class Body(object):
             # data = data.permute([2, 0, 1]).unsqueeze(0).float()
             with torch.no_grad():
                 Mconv7_stage6_L1, Mconv7_stage6_L2 = self.model(data)
+                # 在 body.py 第 56 行之后加入：
+                print(
+                    f"Output Range - PAF: [{Mconv7_stage6_L1.min():.4f}, {Mconv7_stage6_L1.max():.4f}], HM: [{Mconv7_stage6_L2.min():.4f}, {Mconv7_stage6_L2.max():.4f}]")
+
             Mconv7_stage6_L1 = Mconv7_stage6_L1.cpu().numpy()
             Mconv7_stage6_L2 = Mconv7_stage6_L2.cpu().numpy()
 
@@ -61,8 +74,8 @@ class Body(object):
             paf = paf[:imageToTest_padded.shape[0] - pad[2], :imageToTest_padded.shape[1] - pad[3], :]
             paf = cv2.resize(paf, (oriImg.shape[1], oriImg.shape[0]), interpolation=cv2.INTER_CUBIC)
 
-            heatmap_avg += heatmap_avg + heatmap / len(multiplier)
-            paf_avg += + paf / len(multiplier)
+            heatmap_avg += heatmap / len(multiplier)
+            paf_avg += paf / len(multiplier)
 
         all_peaks = []
         peak_counter = 0
@@ -90,14 +103,19 @@ class Body(object):
             all_peaks.append(peaks_with_score_and_id)
             peak_counter += len(peaks)
 
+        total_peaks = sum(len(part) for part in all_peaks)
+        print(f"Detected {total_peaks} peaks across all 18 parts.")
         # find connection in the specified sequence, center 29 is in the position 15
-        limbSeq = [[2, 3], [2, 6], [3, 4], [4, 5], [6, 7], [7, 8], [2, 9], [9, 10], \
-                   [10, 11], [2, 12], [12, 13], [13, 14], [2, 1], [1, 15], [15, 17], \
-                   [1, 16], [16, 18], [3, 17], [6, 18]]
-        # the middle joints heatmap correpondence
-        mapIdx = [[31, 32], [39, 40], [33, 34], [35, 36], [41, 42], [43, 44], [19, 20], [21, 22], \
-                  [23, 24], [25, 26], [27, 28], [29, 30], [47, 48], [49, 50], [53, 54], [51, 52], \
-                  [55, 56], [37, 38], [45, 46]]
+        # 修改 limbSeq 以匹配 train.py 中的 LIMBS 顺序
+        limbSeq = [[1, 2], [1, 5], [2, 3], [3, 4], [5, 6], [6, 7], [1, 8], [1, 11], \
+                   [8, 9], [9, 10], [11, 12], [12, 13], [1, 0], [0, 14], [14, 16], \
+                   [0, 15], [15, 17], [2, 16], [5, 17]]
+
+        # 修改 mapIdx 以匹配 train.py 中的 LIMBS 顺序
+        # 索引计算方式：(limb_index * 2 + 1, limb_index * 2 + 2) 因为 mapIdx 是从 1 开始计数的
+        mapIdx = [[1, 2], [3, 4], [5, 6], [7, 8], [9, 10], [11, 12], [13, 14], [15, 16], \
+                  [17, 18], [19, 20], [21, 22], [23, 24], [25, 26], [27, 28], [29, 30], \
+                  [31, 32], [33, 34], [35, 36], [37, 38]]
 
         connection_all = []
         special_k = []
@@ -109,7 +127,9 @@ class Body(object):
             candB = all_peaks[limbSeq[k][1] - 1]
             nA = len(candA)
             nB = len(candB)
-            indexA, indexB = limbSeq[k]
+            # 【调试】打印每个肢体的候选点数量
+            if nA > 0 and nB > 0:
+                print(f"Limb {k} ({limbSeq[k]}): Found {nA} A-points and {nB} B-points.")
             if (nA != 0 and nB != 0):
                 connection_candidate = []
                 for i in range(nA):
@@ -132,6 +152,11 @@ class Body(object):
                             0.5 * oriImg.shape[0] / norm - 1, 0)
                         criterion1 = len(np.nonzero(score_midpts > thre2)[0]) > 0.8 * len(score_midpts)
                         criterion2 = score_with_dist_prior > 0
+
+                        if k < 5:  # 打印前几个肢体的状态
+                            print(
+                                f"  Limb {k}: c1={criterion1}, c2={criterion2}, avg_score={sum(score_midpts) / len(score_midpts):.4f}")
+
                         if criterion1 and criterion2:
                             connection_candidate.append(
                                 [i, j, score_with_dist_prior, score_with_dist_prior + candA[i][2] + candB[j][2]])
@@ -213,6 +238,10 @@ if __name__ == "__main__":
     test_image = '../images/ski.jpg'
     oriImg = cv2.imread(test_image)  # B,G,R order
     candidate, subset = body_estimation(oriImg)
+    print("Candidate shape:", candidate.shape)  # 应该是 (N, 4)，N是点数
+    print("Subset shape:", subset.shape)  # 应该是 (M, 20)，M是人数
+    if subset.size > 0:
+        print("Subset content:", subset)
     canvas = util.draw_bodypose(oriImg, candidate, subset)
     plt.imshow(canvas[:, :, [2, 1, 0]])
     plt.show()

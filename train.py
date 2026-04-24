@@ -9,23 +9,17 @@ Usage:
   python train.py --data_dir /path/to/coco --epochs 100 --batch_size 8
 """
 
-import os
-import time
-from datetime import datetime
-
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-
 import argparse
 import json
-import math
+import os
+from datetime import datetime
 
-import numpy as np
 import cv2
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from datetime import datetime
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -364,13 +358,6 @@ def train(args):
     # model
     model = BodyPoseTrainModel().to(device)
 
-    # Debug: Print model output shapes
-    dummy_input = torch.randn(1, 3, INPUT_SIZE, INPUT_SIZE).to(device)
-    with torch.no_grad():
-        paf_stages, hm_stages = model(dummy_input)
-        print(f"Model output - PAF stages: {[p.shape for p in paf_stages]}")
-        print(f"Model output - HM stages: {[h.shape for h in hm_stages]}")
-
     if args.resume:
         state = torch.load(args.resume, map_location=device)
         model.load_state_dict(state)
@@ -393,6 +380,8 @@ def train(args):
         optimizer, milestones=[int(args.epochs * 0.6),
                                int(args.epochs * 0.85)], gamma=0.1)
 
+    # 混合精度训练
+    scaler = torch.cuda.amp.GradScaler()
     writer = None
     if SummaryWriter is not None:
         try:
@@ -415,17 +404,22 @@ def train(args):
             paf_gt = paf_gt.to(device)
             hm_gt = hm_gt.to(device)
             paf_mask = paf_mask.to(device)
-
-            paf_stages, hm_stages = model(imgs)
-            loss = criterion(paf_stages, hm_stages, paf_gt, hm_gt, paf_mask)
-            optimizer.zero_grad()
-            loss.backward()
+            # Forward pass with automatic mixed precision
+            with torch.cuda.amp.autocast():
+                paf_stages, hm_stages = model(imgs)
+                loss = criterion(paf_stages, hm_stages, paf_gt, hm_gt, paf_mask)
+            # Backward pass with scaling
+            scaler.scale(loss).backward()
+            # Unscale gradients before clipping
+            scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
+
             train_loss += loss.item()
             if step % 100 == 0:
                 print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  Epoch {epoch} step {step}/{len(train_loader)}"
-                    f"  loss={loss.item():.4f}")
+                      f"  loss={loss.item():.4f}")
 
         avg_train = train_loss / len(train_loader)
         if writer is not None:
@@ -443,9 +437,12 @@ def train(args):
                 paf_gt = paf_gt.to(device)
                 hm_gt = hm_gt.to(device)
                 paf_mask = paf_mask.to(device)
-                paf_stages, hm_stages = model(imgs)
-                val_loss += criterion(paf_stages, hm_stages,
-                                      paf_gt, hm_gt, paf_mask).item()
+
+                # Use autocast in validation as well for consistency and memory saving
+                with torch.cuda.amp.autocast():
+                    paf_stages, hm_stages = model(imgs)
+                    val_loss += criterion(paf_stages, hm_stages,
+                                          paf_gt, hm_gt, paf_mask).item()
 
         avg_val = val_loss / len(val_loader)
         if writer is not None:
@@ -464,12 +461,12 @@ def train(args):
         if avg_val < best_val:
             best_val = avg_val
             torch.save(model.state_dict(),
-                       os.path.join(args.save_dir, "best.pth"))
+                       os.path.join(args.save_dir, f"best_epoch{epoch:04d}_loss{best_val:.4f}.pth"))
 
         # periodic checkpoint
         if epoch % args.save_every == 0:
             torch.save(model.state_dict(),
-                       os.path.join(args.save_dir, f"epoch_{epoch:04d}.pth"))
+                       os.path.join(args.save_dir, f"epoch{epoch:04d}_loss{avg_val:.4f}.pth"))
 
     if writer is not None:
         try:
@@ -486,14 +483,13 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", default="./data")
     parser.add_argument("--preprocessed_dir", default="./preprocessed")
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=5e-4)
-    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--workers", type=int, default=12)
     parser.add_argument("--save_dir", default="checkpoints")
     parser.add_argument("--log_dir", default="runs")
     parser.add_argument("--save_every", type=int, default=1)
-    parser.add_argument("--resume", default=None,
-                        help="Path to checkpoint to resume from")
+    parser.add_argument("--resume", default="./checkpoints/epoch0002_val0.3889.pth")
     args = parser.parse_args()
     train(args)
