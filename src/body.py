@@ -122,7 +122,8 @@ class Body(object):
         mid_num = 10
 
         for k in range(len(mapIdx)):
-            score_mid = paf_avg[:, :, [x - 19 for x in mapIdx[k]]]
+            # score_mid = paf_avg[:, :, [x - 19 for x in mapIdx[k]]]
+            score_mid = paf_avg[:, :, [mapIdx[k][0] - 1, mapIdx[k][1] - 1]]
             candA = all_peaks[limbSeq[k][0] - 1]
             candB = all_peaks[limbSeq[k][1] - 1]
             nA = len(candA)
