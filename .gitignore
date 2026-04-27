@@ -9,3 +9,6 @@ videos/
 data/
 preprocessed/
 runs/
+.codeartsdoer/
+checkpoints/
+output/

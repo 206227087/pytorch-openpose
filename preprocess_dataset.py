@@ -1,41 +1,44 @@
+"""Pre-compute ground truth heatmaps, PAFs, and masks for the COCO dataset.
 
-# preprocess_dataset.py - 运行一次即可
+Saves each image's ground truth as a .npz file for faster training.
+Run once before training: python preprocess_dataset.py
+"""
+
 import os
-import json
+
 import numpy as np
-import cv2
 from tqdm import tqdm
 
-# 导入 train.py 中的函数和常量
-from train import (
-    CocoKeypoints, make_heatmap, make_paf, 
-    HEATMAP_SIZE, SIGMA, PAF_SIGMA, NUM_PAF_CHANNELS, NUM_JOINTS
-)
+from src.utils.CustomDataSet import CustomDataSet
+
 
 def preprocess_and_save(data_dir, split="train2017", output_dir="./preprocessed"):
     """Preprocess dataset and save ground truth tensors."""
     os.makedirs(output_dir, exist_ok=True)
-    
-    dataset = CocoKeypoints(data_dir, split)
+
+    dataset = CustomDataSet(data_dir, split)
     output_split_dir = os.path.join(output_dir, split)
     os.makedirs(output_split_dir, exist_ok=True)
-    
+
     print(f"Preprocessing {len(dataset)} images...")
-    
+
     for idx in tqdm(range(len(dataset))):
         iid = dataset.image_ids[idx]
-
-        # Get the aggregated tensors from dataset
         img, paf_t, hm_t, mask_t = dataset[idx]
-        
-        # Save as .npz file
+
+        # Get image path
+        img_path = os.path.join(dataset.img_dir, dataset.id2file[iid])
+
         save_path = os.path.join(output_split_dir, f"{iid}.npz")
-        np.savez(save_path, 
-                 paf=paf_t.numpy(), 
-                 hm=hm_t.numpy(), 
-                 mask=mask_t.numpy())
-    
+
+        np.savez_compressed(save_path,
+                            img_path=np.array(img_path.encode('utf-8')),
+                            paf=paf_t.numpy().astype(np.float16),
+                            hm=hm_t.numpy().astype(np.float16),
+                            mask=mask_t.numpy().astype(np.float16))
+
     print(f"Preprocessed data saved to {output_split_dir}")
+
 
 if __name__ == "__main__":
     preprocess_and_save("./data", "val2017")
