@@ -150,7 +150,7 @@ if __name__ == '__main__':
     if args.command is None:
         args.command = 'image'
         args.image = 'images/000000033221.jpg'
-        args.model = 'checkpoints/hrnet_w32_epoch0011_loss0.0672.pth'
+        args.model = 'checkpoints/hrnet_w32_epoch0013_loss0.0716.pth'
         args.width = 32
         args.input_size = 256
 

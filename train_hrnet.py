@@ -100,8 +100,11 @@ class HRNetLoss(nn.Module):
 
         # 2. Heatmap Loss
         hm_pred_sigmoid = torch.sigmoid(hm_pred)
-        weight = torch.where(hm_gt > 0.1, torch.tensor(10.0, device=hm_gt.device),
-                             torch.tensor(1.0, device=hm_gt.device))
+        weight = torch.where(hm_gt > 0.5,
+                             torch.tensor(20.0, device=hm_gt.device),
+                             torch.where(hm_gt > 0.1,
+                                         torch.tensor(5.0, device=hm_gt.device),
+                                         torch.tensor(0.1, device=hm_gt.device)))
         hm_loss = ((hm_pred_sigmoid - hm_gt) ** 2 * weight).mean()
 
         # print(f"  paf_loss={paf_loss * 0.5:.4f}  hm_loss={hm_loss * 0.5:.4f}")
@@ -114,7 +117,7 @@ class HRNetLoss(nn.Module):
 DEBUG_OUTPUT_DIR = 'output/hrnet_train'
 
 
-def save_heatmap_comparison(img, hm_pred, hm_gt, paf_pred, paf_gt, epoch, save_dir):
+def save_heatmap_comparison(img, hm_pred, hm_gt, paf_pred, paf_gt, epoch, step, save_dir):
     """Save comparison of predicted vs GT heatmaps and PAF.
 
     Args:
@@ -134,22 +137,26 @@ def save_heatmap_comparison(img, hm_pred, hm_gt, paf_pred, paf_gt, epoch, save_d
     img_np = img.cpu().numpy().transpose(1, 2, 0)
     img_vis = ((img_np * std + mean) * 255).clip(0, 255).astype(np.uint8)
 
+    new_imgs = []
     # Visualize heatmap joints
     for j in range(hm_pred.shape[0]):
         gt_hm = hm_gt[j].astype(np.float32)
-        gt_hm = cv2.resize(gt_hm, (img_vis.shape[1], img_vis.shape[0]))
+        gt_hm = cv2.resize(gt_hm, (img_vis.shape[1], img_vis.shape[0]), interpolation=cv2.INTER_CUBIC)
         gt_hm = cv2.normalize(gt_hm, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         gt_hm = cv2.applyColorMap(gt_hm, cv2.COLORMAP_JET)
         gt_blend = cv2.addWeighted(img_vis, 0.5, gt_hm, 0.5, 0)
 
         pred_hm = hm_pred[j].astype(np.float32)
-        pred_hm = cv2.resize(pred_hm, (img_vis.shape[1], img_vis.shape[0]))
+        # 在可视化前添加
+        pred_hm = np.maximum(pred_hm - 0.1, 0)  # 过滤低置信度响应
+        pred_hm = pred_hm / (pred_hm.max() + 1e-6)  # 重新归一化
+        pred_hm = cv2.resize(pred_hm, (img_vis.shape[1], img_vis.shape[0]), interpolation=cv2.INTER_CUBIC)
         pred_hm = cv2.normalize(pred_hm, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         pred_hm = cv2.applyColorMap(pred_hm, cv2.COLORMAP_JET)
         pred_blend = cv2.addWeighted(img_vis, 0.5, pred_hm, 0.5, 0)
 
         comparison = np.concatenate([gt_blend, pred_blend], axis=1)
-        cv2.imwrite(os.path.join(save_dir, f'epoch{epoch:04d}_joint{j:02d}.jpg'), comparison)
+        new_imgs.append(comparison)
 
     # Visualize PAF limbs
     for limb_k in range(paf_pred.shape[0] // 2):
@@ -157,7 +164,7 @@ def save_heatmap_comparison(img, hm_pred, hm_gt, paf_pred, paf_gt, epoch, save_d
         gt_px = paf_gt[limb_k * 2]
         gt_py = paf_gt[limb_k * 2 + 1]
         gt_mag = np.sqrt(gt_px ** 2 + gt_py ** 2).astype(np.float32)
-        gt_norm = cv2.resize(gt_mag, (img_vis.shape[1], img_vis.shape[0]))
+        gt_norm = cv2.resize(gt_mag, (img_vis.shape[1], img_vis.shape[0]), interpolation=cv2.INTER_CUBIC)
         gt_norm = cv2.normalize(gt_norm, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         gt_norm = cv2.applyColorMap(gt_norm, cv2.COLORMAP_HOT)
         gt_blend = cv2.addWeighted(img_vis, 0.5, gt_norm, 0.5, 0)
@@ -166,13 +173,17 @@ def save_heatmap_comparison(img, hm_pred, hm_gt, paf_pred, paf_gt, epoch, save_d
         pred_px = paf_pred[limb_k * 2]
         pred_py = paf_pred[limb_k * 2 + 1]
         pred_mag = np.sqrt(pred_px ** 2 + pred_py ** 2).astype(np.float32)
-        pred_norm = cv2.resize(pred_mag, (img_vis.shape[1], img_vis.shape[0]))
+        pred_norm = cv2.resize(pred_mag, (img_vis.shape[1], img_vis.shape[0]), interpolation=cv2.INTER_CUBIC)
         pred_norm = cv2.normalize(pred_norm, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         pred_norm = cv2.applyColorMap(pred_norm, cv2.COLORMAP_HOT)
         pred_blend = cv2.addWeighted(img_vis, 0.5, pred_norm, 0.5, 0)
 
         comparison = np.concatenate([gt_blend, pred_blend], axis=1)
-        cv2.imwrite(os.path.join(save_dir, f'epoch{epoch:04d}_paf_limb{limb_k:02d}.jpg'), comparison)
+        new_imgs.append(comparison)
+
+    for i in range(len(new_imgs) // 2):
+        comparison = np.concatenate([new_imgs[i], new_imgs[len(new_imgs) // 2 + i]], axis=0)
+        cv2.imwrite(os.path.join(save_dir, f'epoch{epoch:04d}_step{step:02d}_img{i:02d}.jpg'), comparison)
 
 
 # --- Training Loop ------------------------------------------------------------
@@ -201,6 +212,7 @@ def train(args):
         heatmap_size=args.heatmap_size,
         sigma=args.sigma,
         paf_sigma=args.paf_sigma,
+        augment=False
     )
     val_ds = HRNetCocoDataset(
         args.data_dir, split="val2017",
@@ -208,6 +220,7 @@ def train(args):
         heatmap_size=args.heatmap_size,
         sigma=args.sigma,
         paf_sigma=args.paf_sigma,
+        augment=False
     )
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size,
@@ -284,7 +297,7 @@ def train(args):
 
             if (step + 1) % args.accumulation_steps == 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
@@ -292,6 +305,16 @@ def train(args):
             train_loss += loss.item() * args.accumulation_steps
 
             if (step + 1) % max(1, len(train_loader) // 5) == 0:
+                save_heatmap_comparison(
+                    imgs[0],
+                    hm_pred[0].detach().cpu().numpy(),
+                    hm_gt[0].cpu().numpy(),
+                    paf_pred[0].detach().cpu().numpy(),
+                    paf_gt[0].cpu().numpy(),
+                    epoch=epoch,
+                    step=step + 1,
+                    save_dir=DEBUG_OUTPUT_DIR
+                )
                 now = time.time()
                 step_time = now - last_step_finished_time
                 steps_per_sec = max(1, len(train_loader) // 5) / step_time
@@ -377,22 +400,22 @@ def train(args):
             )
 
         # Debug visualization
-        if args.debug and epoch % args.debug_every == 0:
-            model.eval()
-            with torch.no_grad():
-                imgs_vis, paf_gt_vis, hm_gt_vis, _ = next(iter(val_loader))
-                imgs_vis = imgs_vis[:1].to(device)
-                with torch.amp.autocast('cuda'):
-                    paf_pred_vis, hm_pred_vis = model(imgs_vis)
-                save_heatmap_comparison(
-                    imgs_vis[0],
-                    hm_pred_vis[0].cpu().numpy(),
-                    hm_gt_vis[0].numpy(),
-                    paf_pred_vis[0].cpu().numpy(),
-                    paf_gt_vis[0].numpy(),
-                    epoch,
-                    DEBUG_OUTPUT_DIR,
-                )
+        # if args.debug and epoch % args.debug_every == 0:
+        #     model.eval()
+        #     with torch.no_grad():
+        #         imgs_vis, paf_gt_vis, hm_gt_vis, _ = next(iter(val_loader))
+        #         imgs_vis = imgs_vis[:1].to(device)
+        #         with torch.amp.autocast('cuda'):
+        #             paf_pred_vis, hm_pred_vis = model(imgs_vis)
+        #         save_heatmap_comparison(
+        #             imgs_vis[0],
+        #             hm_pred_vis[0].cpu().numpy(),
+        #             hm_gt_vis[0].numpy(),
+        #             paf_pred_vis[0].cpu().numpy(),
+        #             paf_gt_vis[0].numpy(),
+        #             epoch,
+        #             DEBUG_OUTPUT_DIR,
+        #         )
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -427,17 +450,17 @@ if __name__ == "__main__":
                         help="HRNet width: 32 for W32, 48 for W48 (default: 32)")
 
     # Training
-    parser.add_argument("--epochs", type=int, default=20,
+    parser.add_argument("--epochs", type=int, default=150,
                         help="Number of training epochs (default: 210)")
-    parser.add_argument("--batch_size", type=int, default=64,
+    parser.add_argument("--batch_size", type=int, default=16,
                         help="Batch size (default: 32)")
-    parser.add_argument("--accumulation_steps", type=int, default=1,
+    parser.add_argument("--accumulation_steps", type=int, default=8,
                         help="Gradient accumulation steps (effective batch = batch_size * accumulation_steps)")
-    parser.add_argument("--lr", type=float, default=1e-4,
+    parser.add_argument("--lr", type=float, default=1e-2,
                         help="Learning rate (default: 1e-3)")
-    parser.add_argument("--weight_decay", type=float, default=1e-4,
+    parser.add_argument("--weight_decay", type=float, default=5e-5,
                         help="Weight decay (default: 1e-4)")
-    parser.add_argument("--warmup_epochs", type=int, default=5,
+    parser.add_argument("--warmup_epochs", type=int, default=50,
                         help="Warmup epochs for LR schedule (default: 5, 0 to disable)")
     parser.add_argument("--workers", type=int, default=4,
                         help="DataLoader num_workers")

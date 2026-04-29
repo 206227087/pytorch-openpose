@@ -156,15 +156,32 @@ class HRNetCocoDataset(Dataset):
         heatmap_size: output heatmap size (default 64, i.e. stride=4).
         sigma: Gaussian spread for heatmap generation (default 2.0).
         paf_sigma: PAF limb width in heatmap-space pixels (default 2.0).
+        augment: whether to apply data augmentation (default True for train).
     """
 
+    # COCO keypoints 左右对称映射（翻转时需要交换）
+    # 0:nose(对称) 1:left_eye<->2:right_eye 3:left_ear<->4:right_ear
+    # 5:left_shoulder<->6:right_shoulder 7:left_elbow<->8:right_elbow
+    # 9:left_wrist<->10:right_wrist 11:left_hip<->12:right_hip
+    # 13:left_knee<->14:right_knee 15:left_ankle<->16:right_ankle
+    KEYPOINT_FLIP_MAP = [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15]
+
+    # COCO skeleton 翻转映射（limb 索引需要交换）
+    # 原始 limb: 0:(0,1) 1:(0,2) 2:(1,3) 3:(2,4) 4:(5,6) 5:(5,7) 6:(7,9) 7:(6,8)
+    #           8:(8,10) 9:(5,11) 10:(6,12) 11:(11,12) 12:(11,13) 13:(13,15) 14:(12,14) 15:(14,16)
+    # 翻转后: (0,2) (0,1) (2,4) (1,3) (6,5) (6,8) (8,10) (5,7)
+    #        (7,9) (6,12) (5,11) (12,11) (12,14) (14,16) (11,13) (13,15)
+    LIMB_FLIP_MAP = [1, 0, 3, 2, 4, 7, 8, 5, 6, 10, 9, 11, 14, 15, 12, 13]
+
     def __init__(self, data_dir, split="train2017",
-                 input_size=256, heatmap_size=64, sigma=2.0, paf_sigma=2.0):
+                 input_size=256, heatmap_size=64, sigma=2.0, paf_sigma=2.0,
+                 augment=True):
         self.input_size = input_size
         self.heatmap_size = heatmap_size
         self.sigma = sigma
         self.paf_sigma = paf_sigma
         self.scale = heatmap_size / input_size
+        self.augment = augment and "train" in split
 
         self.img_dir = os.path.join(data_dir, "images", split)
         ann_file = os.path.join(data_dir, "annotations",
@@ -188,9 +205,56 @@ class HRNetCocoDataset(Dataset):
 
         self.image_ids = sorted(self.samples.keys())
         print(f"Loaded {len(self.image_ids)} images with keypoints for {split}")
+        if self.augment:
+            print(f"  Data augmentation enabled: random horizontal flip")
 
     def __len__(self):
         return len(self.image_ids)
+
+    def _flip_joints(self, joints, width):
+        """Flip joint coordinates horizontally and swap left-right keypoints.
+
+        Args:
+            joints: list of (x, y, visibility) tuples.
+            width: image width for coordinate flipping.
+
+        Returns:
+            Flipped joints list with left-right keypoint swapping.
+        """
+        flipped = []
+        for x, y, v in joints:
+            new_x = width - 1 - x if v > 0 else x
+            flipped.append((new_x, y, v))
+
+        # Swap left-right symmetric keypoints
+        swapped = [None] * len(flipped)
+        for orig_idx, flip_idx in enumerate(self.KEYPOINT_FLIP_MAP):
+            swapped[flip_idx] = flipped[orig_idx]
+
+        return swapped
+
+    def _flip_paf(self, paf, mask):
+        """Flip PAF horizontally: swap channels and reverse x-component.
+
+        Args:
+            paf: (32, H, W) PAF array.
+            mask: (32, H, W) mask array.
+
+        Returns:
+            Flipped paf and mask arrays.
+        """
+        paf_flipped = np.zeros_like(paf)
+        mask_flipped = np.zeros_like(mask)
+
+        for orig_limb, flip_limb in enumerate(self.LIMB_FLIP_MAP):
+            # X 通道 (偶数索引): 需要反向
+            paf_flipped[flip_limb * 2] = -paf[orig_limb * 2]
+            # Y 通道 (奇数索引): 保持不变
+            paf_flipped[flip_limb * 2 + 1] = paf[orig_limb * 2 + 1]
+            mask_flipped[flip_limb * 2] = mask[orig_limb * 2]
+            mask_flipped[flip_limb * 2 + 1] = mask[orig_limb * 2 + 1]
+
+        return paf_flipped, mask_flipped
 
     def __getitem__(self, idx):
         iid = self.image_ids[idx]
@@ -209,6 +273,14 @@ class HRNetCocoDataset(Dataset):
             elif img.shape[2] == 4:
                 img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
+        # Random horizontal flip for training
+        do_flip = False
+        if self.augment:
+            do_flip = np.random.random() < 0.5
+
+        if do_flip:
+            img = cv2.flip(img, 1)  # 1 = horizontal flip
+
         # Normalize with ImageNet mean/std
         img_float = img.astype(np.float32) / 255.0
         img_float = (img_float - IMAGENET_MEAN) / IMAGENET_STD
@@ -224,15 +296,37 @@ class HRNetCocoDataset(Dataset):
 
         for ann in self.samples[iid]:
             joints = load_coco_joints(ann, self.input_size, orig_w, orig_h)
+
+            # Apply flip to joints if needed
+            if do_flip:
+                joints = self._flip_joints(joints, self.input_size)
+
             # Scale joint coordinates to heatmap space
             scaled = [(x * self.scale, y * self.scale, v) for x, y, v in joints]
 
             # Heatmap: element-wise max across persons
             hm = make_hrnet_heatmap(scaled, self.heatmap_size, self.sigma)
+
+            # Flip heatmap if needed
+            if do_flip:
+                hm = np.flip(hm, axis=2).copy()  # flip along width
+                # Swap left-right keypoint channels
+                hm_swapped = np.zeros_like(hm)
+                for orig_k, flip_k in enumerate(self.KEYPOINT_FLIP_MAP):
+                    hm_swapped[flip_k] = hm[orig_k]
+                hm = hm_swapped
+
             np.maximum(hm_agg, hm, out=hm_agg)
 
             # PAF: for overlapping limbs, keep the one with larger magnitude
             paf, pmask = make_hrnet_paf(scaled, self.heatmap_size, self.paf_sigma)
+
+            # Flip PAF if needed
+            if do_flip:
+                paf = np.flip(paf, axis=2).copy()  # flip along width
+                pmask = np.flip(pmask, axis=2).copy()
+                paf, pmask = self._flip_paf(paf, pmask)
+
             for limb_idx in range(NUM_COCO_LIMBS):
                 paf_limb_mag = np.sqrt(paf[limb_idx * 2] ** 2 + paf[limb_idx * 2 + 1] ** 2)
                 agg_limb_mag = np.sqrt(paf_agg[limb_idx * 2] ** 2 + paf_agg[limb_idx * 2 + 1] ** 2)

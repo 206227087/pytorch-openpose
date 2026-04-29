@@ -389,47 +389,37 @@ class BodyHRNetPose:
         heatmap_avg = np.zeros((h, w, NUM_COCO_JOINTS), dtype=np.float32)
         paf_avg = np.zeros((h, w, NUM_COCO_LIMBS * 2), dtype=np.float32)
 
-        for scale in self.scale_search:
-            new_h = int(h * scale)
-            new_w = int(w * scale)
-            if new_h < 32 or new_w < 32:
-                continue
 
-            # Resize image to scaled size, then to model input size
-            img_scaled = cv2.resize(oriImg, (new_w, new_h))
-            img_input = cv2.resize(img_scaled, (self.input_size, self.input_size))
+        # Resize image to scaled size, then to model input size
+        img_input = cv2.resize(oriImg, (self.input_size, self.input_size))
 
-            # ImageNet normalization
-            img_float = img_input.astype(np.float32) / 255.0
-            img_float = (img_float - IMAGENET_MEAN) / IMAGENET_STD
-            tensor = img_float.transpose(2, 0, 1)
-            data = torch.from_numpy(tensor).unsqueeze(0).float().to(self.device)
+        # ImageNet normalization
+        img_float = img_input.astype(np.float32) / 255.0
+        img_float = (img_float - IMAGENET_MEAN) / IMAGENET_STD
+        tensor = img_float.transpose(2, 0, 1)
+        data = torch.from_numpy(tensor).unsqueeze(0).float().to(self.device)
 
-            # Model forward pass (dual-branch: PAF + heatmap)
-            with torch.no_grad():
-                with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
-                    paf_output, hm_output = self.model(data)
-            paf_np = paf_output.squeeze(0).cpu().numpy().transpose(1, 2, 0).astype(np.float32)   # (H_hm, W_hm, 32)
-            heatmap_np = hm_output.squeeze(0).cpu().numpy().transpose(1, 2, 0).astype(np.float32)  # (H_hm, W_hm, 17)
+        # Model forward pass (dual-branch: PAF + heatmap)
+        with torch.no_grad():
+            with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
+                paf_output, hm_output = self.model(data)
+        paf_np = paf_output.squeeze(0).cpu().numpy().transpose(1, 2, 0).astype(np.float32)   # (H_hm, W_hm, 32)
+        heatmap_np = hm_output.squeeze(0).cpu().numpy().transpose(1, 2, 0).astype(np.float32)  # (H_hm, W_hm, 17)
 
-            # Resize to scaled image size, then to original size
-            paf_resized = cv2.resize(paf_np, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
-            paf_orig = cv2.resize(paf_resized, (w, h), interpolation=cv2.INTER_CUBIC)
-            heatmap_resized = cv2.resize(heatmap_np, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
-            heatmap_orig = cv2.resize(heatmap_resized, (w, h), interpolation=cv2.INTER_CUBIC)
+        # Resize to scaled image size, then to original size
+        paf_orig = cv2.resize(paf_np, (w, h), interpolation=cv2.INTER_CUBIC)
+        heatmap_orig = cv2.resize(heatmap_np, (w, h), interpolation=cv2.INTER_CUBIC)
 
-            paf_avg += paf_orig / len(self.scale_search)
-            heatmap_avg += heatmap_orig / len(self.scale_search)
 
         # ── Debug: save heatmap visualization ──
         save_dir = 'output/hrnet_body_pose'
         os.makedirs(save_dir, exist_ok=True)
-        heatmap_vis = visualize_heatmap(oriImg, heatmap_avg)
+        heatmap_vis = visualize_heatmap(oriImg, heatmap_orig)
         cv2.imwrite(os.path.join(save_dir, 'heatmap_overlay.jpg'), heatmap_vis)
 
         # Save per-joint heatmaps
         for part in range(NUM_COCO_JOINTS):
-            hm_single = heatmap_avg[:, :, part]
+            hm_single = heatmap_orig[:, :, part].astype(np.float32)
             hm_norm = cv2.normalize(hm_single, None, 0, 255, cv2.NORM_MINMAX)
             hm_colored = cv2.applyColorMap(hm_norm.astype(np.uint8), cv2.COLORMAP_JET)
             blend = cv2.addWeighted(oriImg, 0.6, hm_colored, 0.4, 0)
