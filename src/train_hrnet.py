@@ -254,8 +254,14 @@ def do_train(args):
     patience = 20
     patience_counter = 0
     best_epoch = start_epoch - 1
-    reduce_factor = 0.5
     min_lr = args.lr * 0.01
+
+    # ReduceLROnPlateau: 在 warmup 完成后接管学习率调度
+    # 监控 val loss，patience=5 个 epoch 无改善则降低 LR
+    reduce_lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5,
+        min_lr=min_lr
+    )
 
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_start = time.time()
@@ -267,7 +273,7 @@ def do_train(args):
         if writer is not None:
             try:
                 writer.add_scalar("loss/train", avg_train, epoch)
-                writer.add_scalar("lr", scheduler.get_last_lr()[0], epoch)
+                writer.add_scalar("lr", optimizer.param_groups[0]['lr'], epoch)
             except Exception:
                 pass
 
@@ -279,8 +285,13 @@ def do_train(args):
             except Exception:
                 pass
 
-        scheduler.step()
-        current_lr = scheduler.get_last_lr()[0]
+        # 学习率调度：warmup 阶段用 LambdaLR，warmup 结束后用 ReduceLROnPlateau
+        if epoch <= warmup_epochs:
+            scheduler.step()
+        else:
+            reduce_lr_scheduler.step(avg_val)
+
+        current_lr = optimizer.param_groups[0]['lr']
 
         epoch_time = time.time() - epoch_start
         print(
@@ -307,18 +318,6 @@ def do_train(args):
         else:
             patience_counter += 1
             print(f"  → No improvement for {patience_counter} epochs (best: {best_val:.4f} at epoch {best_epoch})")
-
-            # 学习率衰减策略：如果验证 loss 停滞，降低学习率
-            if patience_counter > 0 and patience_counter % 5 == 0 and current_lr > min_lr:
-                new_lr = current_lr * reduce_factor
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = new_lr
-                print(f"  → Reducing learning rate to {new_lr:.2e}")
-
-                # 重新初始化 scheduler
-                scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                    optimizer, T_max=args.epochs - epoch, eta_min=min_lr
-                )
 
             if patience_counter >= patience:
                 print(f"\n{'='*60}")
