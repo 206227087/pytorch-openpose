@@ -16,15 +16,13 @@ class HRNetLoss(nn.Module):
     """
 
     def forward(self, paf_pred, hm_pred, paf_gt, hm_gt, paf_mask):
-        # 1. PAF Loss: 使用全局归一化，改进数值稳定性
-        paf_pred = torch.tanh(paf_pred)  # 约束到 [-1, 1]
+        # 1. PAF Loss: 模型输出已经是 [-1, 1]（tanh在模型输出层）
         paf_diff = (paf_pred - paf_gt) * paf_mask
 
         # 全局 MSE，避免稀疏通道问题
         paf_loss = ((paf_diff ** 2).sum() / (paf_mask.sum() + 1e-6))
 
-        # 2. Heatmap Loss
-        hm_pred = torch.sigmoid(hm_pred)  # 约束到 [0, 1]
+        # 2. Heatmap Loss: 模型输出已经是 [0, 1]（sigmoid在模型输出层）
         weight = torch.where(hm_gt > 0.5,
                              torch.tensor(8.0, device=hm_gt.device),
                              torch.where(hm_gt > 0.1,
@@ -34,4 +32,4 @@ class HRNetLoss(nn.Module):
 
         # print(f"  paf_loss={paf_loss * 0.5:.4f}  hm_loss={hm_loss * 0.5:.4f}")
         # 平衡两个 Loss
-        return paf_loss * 0.25 + hm_loss * 0.75
+        return paf_loss * 0.5 + hm_loss * 0.5

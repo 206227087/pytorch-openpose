@@ -431,9 +431,7 @@ class BodyHRNetPose:
                 with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
                     paf_output, hm_output = self.model(data)
 
-            # Apply sigmoid to heatmap to match training loss (which uses sigmoid)
-            hm_output = torch.sigmoid(hm_output)
-
+            # Model output already constrained: heatmap in [0,1], PAF in [-1,1]
             paf_np = paf_output.squeeze(0).cpu().numpy().transpose(1, 2, 0).astype(np.float32)   # (H_hm, W_hm, 32)
             heatmap_np = hm_output.squeeze(0).cpu().numpy().transpose(1, 2, 0).astype(np.float32)  # (H_hm, W_hm, 17)
 

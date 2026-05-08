@@ -315,8 +315,8 @@ class HRNet(nn.Module):
                 )
                 x_high_res = x_high_res + self.aggregate[i](upsampled)
 
-        heatmap = self.heatmap_head(x_high_res)
-        paf = self.paf_head(x_high_res)
+        heatmap = torch.sigmoid(self.heatmap_head(x_high_res))  # [0, 1]
+        paf = torch.tanh(self.paf_head(x_high_res))            # [-1, 1]
         return paf, heatmap
 
     def extra_repr(self):

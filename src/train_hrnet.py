@@ -404,8 +404,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
     # 以下列参数覆盖默认参数
     args.augment = True
-    args.sigma = 1.0
-    args.paf_sigma = 1.0
+    args.sigma = 2.0
+    args.paf_sigma = 3.0
     args.epochs = 150
     args.batch_size = 32
     args.lr = 2e-4
