@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 import torch
 
-from src.model import HRNet
+from src.models.hrnet_model import HRNet
 from src.inference import MixedPrecisionInference
 
 

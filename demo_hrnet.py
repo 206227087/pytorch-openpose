@@ -18,7 +18,7 @@ import torch
 
 from src.hrnet_body_pose import BodyHRNetPose, convert_to_openpose_format
 from src.inference import profile_model
-from src.model import HRNet
+from src.models.hrnet_model import HRNet
 
 
 def demo_image(image_path, model_path, width=32, input_size=256):
@@ -77,7 +77,7 @@ def demo_profile(width=32, input_size=256):
 
     # Profile OpenPose for comparison
     print(f"\n--- OpenPose Profiling ---")
-    from src.model import bodypose_model
+    from src.models.hrnet_model import bodypose_model
     openpose = bodypose_model().to(device).eval()
     stats_op = profile_model(openpose, input_shape=(1, 3, 368, 368),
                              device=device)

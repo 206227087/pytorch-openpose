@@ -56,7 +56,7 @@ class RealTimePoseEstimator:
         if backend == 'openpose':
             self.body = Body(body_model_path)
         elif backend == 'hrnet':
-            from src.model import HRNet
+            from src.models.hrnet_model import HRNet
             self.body_model = HRNet(num_joints=17, width=32)
             state = torch.load(body_model_path, map_location=self.device)
             self.body_model.load_state_dict(state)

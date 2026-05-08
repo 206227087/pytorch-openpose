@@ -22,8 +22,7 @@ import numpy as np
 import torch
 from scipy.ndimage.filters import gaussian_filter
 
-from src.model import HRNet
-from src import util
+from src.models.hrnet_model import HRNet
 
 # ─── COCO 17 Keypoint Definitions ─────────────────────────────────────────────
 # 0:nose 1:left_eye 2:right_eye 3:left_ear 4:right_ear
@@ -358,10 +357,31 @@ class BodyHRNetPose:
 
         # Build and load model (dual-branch: PAF + heatmap)
         self.model = HRNet(num_joints=NUM_COCO_JOINTS, num_limbs=NUM_COCO_LIMBS, width=width)
-        state = torch.load(model_path, map_location=self.device)
+        state = torch.load(model_path, map_location=self.device, weights_only=True)
         if isinstance(state, dict) and 'state_dict' in state:
             state = state['state_dict']
-        self.model.load_state_dict(state)
+
+        # Handle legacy checkpoints with 'final_layer' instead of 'heatmap_head'/'paf_head'
+        if 'final_layer.weight' in state and 'heatmap_head.0.weight' not in state:
+            print(f"  Converting legacy checkpoint (final_layer -> heatmap_head + paf_head)")
+            final_weight = state.pop('final_layer.weight')  # (17, 32, 1, 1)
+            final_bias = state.pop('final_layer.bias')        # (17,)
+            num_joints_ckpt = final_bias.shape[0]  # 17
+            width_ckpt = final_weight.shape[1]     # 32
+
+            # Map final_layer -> heatmap_head (single conv1x1, no BN/ReLU in between)
+            # Legacy model: final_layer was a bare Conv2d(32, 17, 1)
+            # Current model: heatmap_head has Conv3x3->BN->ReLU->Conv1x1
+            # We can only load the final 1x1 conv; the first layers stay randomly initialized
+            # This is a partial migration - for best results, retrain with the new architecture
+            state['heatmap_head.3.weight'] = final_weight
+            state['heatmap_head.3.bias'] = final_bias
+
+            # PAF head doesn't exist in legacy checkpoint - leave it randomly initialized
+            print(f"  Warning: legacy checkpoint has no PAF head. PAF connections will be random.")
+            print(f"  For best results, use a checkpoint trained with the dual-branch architecture.")
+
+        self.model.load_state_dict(state, strict=False)
         self.model.to(self.device).eval()
         print(f"BodyHRNetPose: HRNet-W{width} loaded from {model_path}")
 
@@ -389,37 +409,55 @@ class BodyHRNetPose:
         heatmap_avg = np.zeros((h, w, NUM_COCO_JOINTS), dtype=np.float32)
         paf_avg = np.zeros((h, w, NUM_COCO_LIMBS * 2), dtype=np.float32)
 
+        for scale in self.scale_search:
+            # Resize image to scaled size
+            new_h = int(h * scale)
+            new_w = int(w * scale)
+            if new_h < 1 or new_w < 1:
+                continue
+            img_scaled = cv2.resize(oriImg, (new_w, new_h))
 
-        # Resize image to scaled size, then to model input size
-        img_input = cv2.resize(oriImg, (self.input_size, self.input_size))
+            # Resize to model input size
+            img_input = cv2.resize(img_scaled, (self.input_size, self.input_size))
 
-        # ImageNet normalization
-        img_float = img_input.astype(np.float32) / 255.0
-        img_float = (img_float - IMAGENET_MEAN) / IMAGENET_STD
-        tensor = img_float.transpose(2, 0, 1)
-        data = torch.from_numpy(tensor).unsqueeze(0).float().to(self.device)
+            # ImageNet normalization
+            img_float = img_input.astype(np.float32) / 255.0
+            img_float = (img_float - IMAGENET_MEAN) / IMAGENET_STD
+            tensor = img_float.transpose(2, 0, 1)
+            data = torch.from_numpy(tensor).unsqueeze(0).float().to(self.device)
 
-        # Model forward pass (dual-branch: PAF + heatmap)
-        with torch.no_grad():
-            with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
-                paf_output, hm_output = self.model(data)
-        paf_np = paf_output.squeeze(0).cpu().numpy().transpose(1, 2, 0).astype(np.float32)   # (H_hm, W_hm, 32)
-        heatmap_np = hm_output.squeeze(0).cpu().numpy().transpose(1, 2, 0).astype(np.float32)  # (H_hm, W_hm, 17)
+            # Model forward pass (dual-branch: PAF + heatmap)
+            with torch.no_grad():
+                with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
+                    paf_output, hm_output = self.model(data)
 
-        # Resize to scaled image size, then to original size
-        paf_orig = cv2.resize(paf_np, (w, h), interpolation=cv2.INTER_CUBIC)
-        heatmap_orig = cv2.resize(heatmap_np, (w, h), interpolation=cv2.INTER_CUBIC)
+            # Apply sigmoid to heatmap to match training loss (which uses sigmoid)
+            hm_output = torch.sigmoid(hm_output)
 
+            paf_np = paf_output.squeeze(0).cpu().numpy().transpose(1, 2, 0).astype(np.float32)   # (H_hm, W_hm, 32)
+            heatmap_np = hm_output.squeeze(0).cpu().numpy().transpose(1, 2, 0).astype(np.float32)  # (H_hm, W_hm, 17)
+
+            # Resize to scaled image size, then to original size
+            paf_orig = cv2.resize(paf_np, (w, h), interpolation=cv2.INTER_CUBIC)
+            heatmap_orig = cv2.resize(heatmap_np, (w, h), interpolation=cv2.INTER_CUBIC)
+
+            # Accumulate across scales
+            heatmap_avg += heatmap_orig
+            paf_avg += paf_orig
+
+        # Average across scales
+        heatmap_avg /= len(self.scale_search)
+        paf_avg /= len(self.scale_search)
 
         # ── Debug: save heatmap visualization ──
         save_dir = 'output/hrnet_body_pose'
         os.makedirs(save_dir, exist_ok=True)
-        heatmap_vis = visualize_heatmap(oriImg, heatmap_orig)
+        heatmap_vis = visualize_heatmap(oriImg, heatmap_avg)
         cv2.imwrite(os.path.join(save_dir, 'heatmap_overlay.jpg'), heatmap_vis)
 
         # Save per-joint heatmaps
         for part in range(NUM_COCO_JOINTS):
-            hm_single = heatmap_orig[:, :, part].astype(np.float32)
+            hm_single = heatmap_avg[:, :, part].astype(np.float32)
             hm_norm = cv2.normalize(hm_single, None, 0, 255, cv2.NORM_MINMAX)
             hm_colored = cv2.applyColorMap(hm_norm.astype(np.uint8), cv2.COLORMAP_JET)
             blend = cv2.addWeighted(oriImg, 0.6, hm_colored, 0.4, 0)

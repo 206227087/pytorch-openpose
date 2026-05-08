@@ -16,46 +16,25 @@ import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-
-# COCO 17 keypoints:
-# 0:nose 1:left_eye 2:right_eye 3:left_ear 4:right_ear
-# 5:left_shoulder 6:right_shoulder 7:left_elbow 8:right_elbow
-# 9:left_wrist 10:right_wrist 11:left_hip 12:right_hip
-# 13:left_knee 14:right_knee 15:left_ankle 16:right_ankle
-NUM_COCO_JOINTS = 17
-
-# COCO skeleton connections (16 limbs)
-COCO_SKELETON = [
-    (0, 1), (0, 2), (1, 3), (2, 4),         # face
-    (5, 6), (5, 7), (7, 9), (6, 8),         # arms
-    (8, 10), (5, 11), (6, 12),              # torso
-    (11, 12), (11, 13), (13, 15),           # left leg
-    (12, 14), (14, 16),                     # right leg
-]
-NUM_COCO_LIMBS = len(COCO_SKELETON)  # 16
-NUM_PAF_CHANNELS = NUM_COCO_LIMBS * 2  # 32
-
-# ImageNet normalization constants
-IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+from src.config import NUM_JOINTS, NUM_PAF_CHANNELS, SKELETONS, NUM_LIMBS, KEYPOINT_FLIP_MAP
 
 
-def make_hrnet_heatmap(joints, size, sigma):
-    """Generate Gaussian heatmaps for 17 COCO keypoints.
+def make_heatmap(joints, size, sigma):
+    """Generate Gaussian heatmaps for 18 key points.
 
     Args:
-        joints: list of (x, y, visibility) tuples, length 17.
+        joints: list of (x, y, visibility) tuples.
         size: heatmap spatial size (e.g., 64 for 256x256 input with stride 4).
         sigma: Gaussian spread in heatmap-space pixels.
 
     Returns:
-        hm: (17, size, size) float32 array.
+        hm: (NUM_JOINTS, size, size) float32 array.
     """
-    hm = np.zeros((NUM_COCO_JOINTS, size, size), dtype=np.float32)
+    hm = np.zeros((NUM_JOINTS, size, size), dtype=np.float32)
     y_grid, x_grid = np.mgrid[0:size, 0:size]
 
     for j_idx, (x, y, v) in enumerate(joints):
-        if v == 0 or j_idx >= NUM_COCO_JOINTS:
+        if v == 0 or j_idx >= NUM_JOINTS:
             continue
         g = np.exp(-((x_grid - x) ** 2 + (y_grid - y) ** 2) / (2 * sigma ** 2))
         np.maximum(hm[j_idx], g, out=hm[j_idx])
@@ -63,23 +42,23 @@ def make_hrnet_heatmap(joints, size, sigma):
     return hm
 
 
-def make_hrnet_paf(joints, size, sigma):
-    """Generate Part Affinity Fields for 16 COCO limbs (32 channels).
+def make_paf(joints, size, sigma):
+    """Generate Part Affinity Fields for NUM_LIMBS (18 limbs 36 channels).
 
     Args:
-        joints: list of (x, y, visibility) tuples in heatmap-space coords.
+        joints: list of (x, y, visibility) tuples.
         size: PAF spatial size (e.g., 64).
         sigma: PAF limb width in heatmap-space pixels.
 
     Returns:
-        paf: (32, size, size) float32 array.
-        mask: (32, size, size) float32 array (1 where limb is present).
+        paf: (NUM_PAF_CHANNELS, size, size) float32 array.
+        mask: (NUM_PAF_CHANNELS, size, size) float32 array (1 where limb is present).
     """
     paf = np.zeros((NUM_PAF_CHANNELS, size, size), dtype=np.float32)
     mask = np.zeros((NUM_PAF_CHANNELS, size, size), dtype=np.float32)
     y_grid, x_grid = np.mgrid[0:size, 0:size]
 
-    for limb_idx, (ja, jb) in enumerate(COCO_SKELETON):
+    for limb_idx, (ja, jb) in enumerate(SKELETONS):
         if ja >= len(joints) or jb >= len(joints):
             continue
 
@@ -111,8 +90,9 @@ def make_hrnet_paf(joints, size, sigma):
     return paf, mask
 
 
-def load_coco_joints(ann, input_size, orig_w, orig_h):
-    """Load COCO 17 keypoints from annotation, scaled to input_size.
+def load_joints(ann, input_size, orig_w, orig_h):
+    """Load 17 COCO key points from annotation, scaled to input_size.
+    Calculate neck point by left shoulder and right shoulder.
 
     Args:
         ann: COCO annotation dict with 'keypoints' field.
@@ -127,7 +107,7 @@ def load_coco_joints(ann, input_size, orig_w, orig_h):
     sy = input_size / orig_h
 
     joints = []
-    for i in range(NUM_COCO_JOINTS):
+    for i in range(NUM_JOINTS - 1):
         x, y, v = kps[i * 3], kps[i * 3 + 1], kps[i * 3 + 2]
         if v > 0:
             x = x * sx
@@ -136,13 +116,30 @@ def load_coco_joints(ann, input_size, orig_w, orig_h):
             y = min(max(y, 0), input_size - 1)
         joints.append((x, y, v))
 
+    # Calculate neck as midpoint of left shoulder (index 5) and right shoulder (index 6)
+    left_shoulder = joints[5]  # (x, y, v)
+    right_shoulder = joints[6]  # (x, y, v)
+
+    # Neck visibility: both shoulders must be visible
+    neck_v = min(left_shoulder[2], right_shoulder[2])
+
+    if neck_v > 0:
+        neck_x = (left_shoulder[0] + right_shoulder[0]) / 2.0
+        neck_y = (left_shoulder[1] + right_shoulder[1]) / 2.0
+        neck_x = min(max(neck_x, 0), input_size - 1)
+        neck_y = min(max(neck_y, 0), input_size - 1)
+    else:
+        neck_x = 0.0
+        neck_y = 0.0
+
+    joints.append((neck_x, neck_y, neck_v))
     return joints
 
 
 class HRNetCocoDataset(Dataset):
     """COCO keypoint dataset for HRNet multi-person training.
 
-    Generates 17-channel heatmap targets AND 32-channel PAF targets with
+    Generates 18-channel heatmap targets AND 36-channel PAF targets with
     masks from COCO annotations. Images are resized to input_size x
     input_size and normalized with ImageNet mean/std.
 
@@ -158,20 +155,6 @@ class HRNetCocoDataset(Dataset):
         paf_sigma: PAF limb width in heatmap-space pixels (default 2.0).
         augment: whether to apply data augmentation (default True for train).
     """
-
-    # COCO keypoints 左右对称映射（翻转时需要交换）
-    # 0:nose(对称) 1:left_eye<->2:right_eye 3:left_ear<->4:right_ear
-    # 5:left_shoulder<->6:right_shoulder 7:left_elbow<->8:right_elbow
-    # 9:left_wrist<->10:right_wrist 11:left_hip<->12:right_hip
-    # 13:left_knee<->14:right_knee 15:left_ankle<->16:right_ankle
-    KEYPOINT_FLIP_MAP = [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15]
-
-    # COCO skeleton 翻转映射（limb 索引需要交换）
-    # 原始 limb: 0:(0,1) 1:(0,2) 2:(1,3) 3:(2,4) 4:(5,6) 5:(5,7) 6:(7,9) 7:(6,8)
-    #           8:(8,10) 9:(5,11) 10:(6,12) 11:(11,12) 12:(11,13) 13:(13,15) 14:(12,14) 15:(14,16)
-    # 翻转后: (0,2) (0,1) (2,4) (1,3) (6,5) (6,8) (8,10) (5,7)
-    #        (7,9) (6,12) (5,11) (12,11) (12,14) (14,16) (11,13) (13,15)
-    LIMB_FLIP_MAP = [1, 0, 3, 2, 4, 7, 8, 5, 6, 10, 9, 11, 14, 15, 12, 13]
 
     def __init__(self, data_dir, split="train2017",
                  input_size=256, heatmap_size=64, sigma=2.0, paf_sigma=2.0,
@@ -211,50 +194,28 @@ class HRNetCocoDataset(Dataset):
     def __len__(self):
         return len(self.image_ids)
 
-    def _flip_joints(self, joints, width):
-        """Flip joint coordinates horizontally and swap left-right keypoints.
+    @staticmethod
+    def _flip_joints(joints, width):
+        """Flip joint coordinates horizontally and swap left-right key points.
 
         Args:
             joints: list of (x, y, visibility) tuples.
             width: image width for coordinate flipping.
 
         Returns:
-            Flipped joints list with left-right keypoint swapping.
+            Flipped joints list with left-right key point swapping.
         """
         flipped = []
         for x, y, v in joints:
             new_x = width - 1 - x if v > 0 else x
             flipped.append((new_x, y, v))
 
-        # Swap left-right symmetric keypoints
+        # Swap left-right symmetric key points
         swapped = [None] * len(flipped)
-        for orig_idx, flip_idx in enumerate(self.KEYPOINT_FLIP_MAP):
+        for orig_idx, flip_idx in enumerate(KEYPOINT_FLIP_MAP):
             swapped[flip_idx] = flipped[orig_idx]
 
         return swapped
-
-    def _flip_paf(self, paf, mask):
-        """Flip PAF horizontally: swap channels and reverse x-component.
-
-        Args:
-            paf: (32, H, W) PAF array.
-            mask: (32, H, W) mask array.
-
-        Returns:
-            Flipped paf and mask arrays.
-        """
-        paf_flipped = np.zeros_like(paf)
-        mask_flipped = np.zeros_like(mask)
-
-        for orig_limb, flip_limb in enumerate(self.LIMB_FLIP_MAP):
-            # X 通道 (偶数索引): 需要反向
-            paf_flipped[flip_limb * 2] = -paf[orig_limb * 2]
-            # Y 通道 (奇数索引): 保持不变
-            paf_flipped[flip_limb * 2 + 1] = paf[orig_limb * 2 + 1]
-            mask_flipped[flip_limb * 2] = mask[orig_limb * 2]
-            mask_flipped[flip_limb * 2 + 1] = mask[orig_limb * 2 + 1]
-
-        return paf_flipped, mask_flipped
 
     def __getitem__(self, idx):
         iid = self.image_ids[idx]
@@ -281,21 +242,20 @@ class HRNetCocoDataset(Dataset):
         if do_flip:
             img = cv2.flip(img, 1)  # 1 = horizontal flip
 
-        # Normalize with ImageNet mean/std
+        # Normalize
         img_float = img.astype(np.float32) / 255.0
-        img_float = (img_float - IMAGENET_MEAN) / IMAGENET_STD
         img_tensor = torch.from_numpy(img_float.transpose(2, 0, 1))
 
         # Generate aggregated heatmap and PAF from all person annotations
-        hm_agg = np.zeros((NUM_COCO_JOINTS, self.heatmap_size, self.heatmap_size),
-                           dtype=np.float32)
+        hm_agg = np.zeros((NUM_JOINTS, self.heatmap_size, self.heatmap_size),
+                          dtype=np.float32)
         paf_agg = np.zeros((NUM_PAF_CHANNELS, self.heatmap_size, self.heatmap_size),
-                            dtype=np.float32)
+                           dtype=np.float32)
         mask_agg = np.zeros((NUM_PAF_CHANNELS, self.heatmap_size, self.heatmap_size),
-                             dtype=np.float32)
+                            dtype=np.float32)
 
         for ann in self.samples[iid]:
-            joints = load_coco_joints(ann, self.input_size, orig_w, orig_h)
+            joints = load_joints(ann, self.input_size, orig_w, orig_h)
 
             # Apply flip to joints if needed
             if do_flip:
@@ -305,29 +265,14 @@ class HRNetCocoDataset(Dataset):
             scaled = [(x * self.scale, y * self.scale, v) for x, y, v in joints]
 
             # Heatmap: element-wise max across persons
-            hm = make_hrnet_heatmap(scaled, self.heatmap_size, self.sigma)
-
-            # Flip heatmap if needed
-            if do_flip:
-                hm = np.flip(hm, axis=2).copy()  # flip along width
-                # Swap left-right keypoint channels
-                hm_swapped = np.zeros_like(hm)
-                for orig_k, flip_k in enumerate(self.KEYPOINT_FLIP_MAP):
-                    hm_swapped[flip_k] = hm[orig_k]
-                hm = hm_swapped
+            hm = make_heatmap(scaled, self.heatmap_size, self.sigma)
 
             np.maximum(hm_agg, hm, out=hm_agg)
 
             # PAF: for overlapping limbs, keep the one with larger magnitude
-            paf, pmask = make_hrnet_paf(scaled, self.heatmap_size, self.paf_sigma)
+            paf, pmask = make_paf(scaled, self.heatmap_size, self.paf_sigma)
 
-            # Flip PAF if needed
-            if do_flip:
-                paf = np.flip(paf, axis=2).copy()  # flip along width
-                pmask = np.flip(pmask, axis=2).copy()
-                paf, pmask = self._flip_paf(paf, pmask)
-
-            for limb_idx in range(NUM_COCO_LIMBS):
+            for limb_idx in range(NUM_LIMBS):
                 paf_limb_mag = np.sqrt(paf[limb_idx * 2] ** 2 + paf[limb_idx * 2 + 1] ** 2)
                 agg_limb_mag = np.sqrt(paf_agg[limb_idx * 2] ** 2 + paf_agg[limb_idx * 2 + 1] ** 2)
                 update_mask = paf_limb_mag > agg_limb_mag
