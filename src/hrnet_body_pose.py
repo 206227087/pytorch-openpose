@@ -20,26 +20,10 @@ import os
 import cv2
 import numpy as np
 import torch
-from scipy.ndimage.filters import gaussian_filter
-
+from scipy.ndimage import gaussian_filter
+from src.config import NUM_JOINTS,NUM_LIMBS,SKELETONS
 from src.models.hrnet_model import HRNet
 
-# ─── COCO 17 Keypoint Definitions ─────────────────────────────────────────────
-# 0:nose 1:left_eye 2:right_eye 3:left_ear 4:right_ear
-# 5:left_shoulder 6:right_shoulder 7:left_elbow 8:right_elbow
-# 9:left_wrist 10:right_wrist 11:left_hip 12:right_hip
-# 13:left_knee 14:right_knee 15:left_ankle 16:right_ankle
-NUM_COCO_JOINTS = 17
-
-# COCO skeleton connections (pairs of joint indices)
-COCO_SKELETON = [
-    (0, 1), (0, 2), (1, 3), (2, 4),         # face
-    (5, 6), (5, 7), (7, 9), (6, 8),         # arms
-    (8, 10), (5, 11), (6, 12),              # torso
-    (11, 12), (11, 13), (13, 15),           # left leg
-    (12, 14), (14, 16),                     # right leg
-]
-NUM_COCO_LIMBS = len(COCO_SKELETON)  # 16
 
 # ─── COCO-to-OpenPose Joint Mapping ──────────────────────────────────────────
 # Maps COCO 17-joint indices to OpenPose 18-joint indices for compatibility
@@ -66,6 +50,7 @@ COCO_TO_OPENPOSE = {
     14: 9,  # right_knee -> r_knee
     15: 13, # left_ankle -> l_ankle
     16: 10, # right_ankle -> r_ankle
+    17: 1,  # neck -> neck
 }
 
 # ─── Inference Parameters ─────────────────────────────────────────────────────
@@ -75,13 +60,8 @@ STRIDE = INPUT_SIZE // HEATMAP_SIZE
 
 SCALE_SEARCH = [0.5, 1.0, 1.5, 2.0]  # Multi-scale inference scales
 PEAK_THRESHOLD = 0.1                  # Heatmap peak detection threshold
-GROUP_THRESHOLD = 0.1                 # Minimum score for skeleton connection
 MIN_KEYPOINTS = 3                     # Minimum keypoints per person
 MIN_AVG_CONF = 0.2                    # Minimum average confidence per person
-
-# ImageNet normalization
-IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
 # ─── Visualization Helpers ────────────────────────────────────────────────────
@@ -132,7 +112,7 @@ def group_keypoints_by_paf(all_peaks, paf_avg, oriImg_shape, mid_num=10,
     """
     connection_all = []
 
-    for limb_idx, (indexA, indexB) in enumerate(COCO_SKELETON):
+    for limb_idx, (indexA, indexB) in enumerate(SKELETONS):
         candA = all_peaks[indexA]
         candB = all_peaks[indexB]
         nA = len(candA)
@@ -163,14 +143,14 @@ def group_keypoints_by_paf(all_peaks, paf_avg, oriImg_shape, mid_num=10,
                 paf_x = paf_avg[:, :, limb_idx * 2]
                 paf_y = paf_avg[:, :, limb_idx * 2 + 1]
 
-                score = 0.0
+                score = 0.0 # 沿连线方向采样
                 for t in range(mid_num):
                     frac = t / mid_num
                     sx = int(round(x1 + frac * dx))
                     sy = int(round(y1 + frac * dy))
                     sx = min(max(sx, 0), oriImg_shape[1] - 1)
                     sy = min(max(sy, 0), oriImg_shape[0] - 1)
-                    score += paf_x[sy, sx] * ux + paf_y[sy, sx] * uy
+                    score += paf_x[sy, sx] * ux + paf_y[sy, sx] * uy    # 向量点积
 
                 score /= mid_num
 
@@ -183,8 +163,8 @@ def group_keypoints_by_paf(all_peaks, paf_avg, oriImg_shape, mid_num=10,
         # Greedy assignment: sort by score, assign each keypoint at most once
         connection_candidate = sorted(connection_candidate, key=lambda x: x[2], reverse=True)
         connection = np.zeros((0, 5))
-        for c in range(len(connection_candidate)):
-            i, j, s = connection_candidate[c][0:3]
+        for c in range(len(connection_candidate)):  # connection结构：col 0: 关节A的关键点ID（全局ID ）col 1: 关节B的关键点ID（全局ID）col 2: PAF连接得分 col 3: 关节A的关键点置信度 col 4: 关节B的关键点置信度
+            i, j, s = connection_candidate[c][0:3]  # 提取关节点索引和paf得分
             if i not in connection[:, 0] and j not in connection[:, 1]:
                 connection = np.vstack([
                     connection,
@@ -212,15 +192,16 @@ def assemble_persons(all_peaks, connection_all):
       subset: (M, 19) array - first 17 cols are keypoint IDs, col 17 is
               total score, col 18 is keypoint count
     """
-    # subset: 17 keypoint slots + score + count = 19 columns
-    subset = -1 * np.ones((0, 19))
+    # subset: NUM_JOINTS keypoint slots + score + count
+    num_cols = NUM_JOINTS + 2
+    subset = -1 * np.ones((0, num_cols))
     candidate = np.array([item for sublist in all_peaks for item in sublist])
 
-    for k in range(NUM_COCO_LIMBS):
+    for k in range(NUM_LIMBS):
         if k >= len(connection_all) or len(connection_all[k]) == 0:
             continue
 
-        indexA, indexB = COCO_SKELETON[k]
+        indexA, indexB = SKELETONS[k]
         partAs = connection_all[k][:, 0]
         partBs = connection_all[k][:, 1]
 
@@ -254,7 +235,7 @@ def assemble_persons(all_peaks, connection_all):
                     subset[j1][-1] += 1
                     subset[j1][-2] += candidate[partBs[i].astype(int), 2] + connection_all[k][i][2]
             elif not found:
-                row = -1 * np.ones(19)
+                row = -1 * np.ones(num_cols)
                 row[indexA] = partAs[i]
                 row[indexB] = partBs[i]
                 row[-1] = 2  # keypoint count
@@ -274,19 +255,19 @@ def assemble_persons(all_peaks, connection_all):
 # ─── Format Conversion ────────────────────────────────────────────────────────
 
 def convert_to_openpose_format(candidate, subset):
-    """Convert COCO 17-joint (candidate, subset) to OpenPose 18-joint format.
+    """Convert 18-joint (candidate, subset) to OpenPose 18-joint format.
 
-    This enables compatibility with util.draw_bodypose() and util.handDetect()
-    which expect OpenPose's 18-joint ordering (with neck at index 1).
+    Training uses 18 joints (COCO 17 + neck), so neck is already at index 17.
+    This function reorders to OpenPose's joint ordering (neck at index 1).
 
     Args:
         candidate: (N, 4) array of [x, y, score, id] from BodyHRNetPose.
-        subset: (M, 19) array from BodyHRNetPose (17 COCO joints + score + count).
+        subset: (M, 20) array from BodyHRNetPose (18 joints + score + count).
 
     Returns:
         candidate: same candidate array (keypoints are unchanged).
         subset_op: (M, 20) array in OpenPose format:
-            - cols 0-17: keypoint indices (18 OpenPose joints, neck=-1)
+            - cols 0-17: keypoint indices (18 OpenPose joints)
             - col 18: total score
             - col 19: keypoint count
     """
@@ -296,29 +277,14 @@ def convert_to_openpose_format(candidate, subset):
     subset_op = -1 * np.ones((len(subset), 20))
 
     for i in range(len(subset)):
-        # Map COCO joint positions to OpenPose positions
+        # Map joint positions to OpenPose ordering
         for coco_idx, openpose_idx in COCO_TO_OPENPOSE.items():
-            if coco_idx < 17:  # Only 17 COCO joints
+            if coco_idx < NUM_JOINTS:
                 subset_op[i, openpose_idx] = subset[i, coco_idx]
 
-        # Compute neck as midpoint of left_shoulder(5) and right_shoulder(6)
-        # In COCO: left_shoulder=5, right_shoulder=6
-        ls_idx = subset[i, 5]  # left_shoulder candidate index
-        rs_idx = subset[i, 6]  # right_shoulder candidate index
-        if ls_idx >= 0 and rs_idx >= 0:
-            # Add neck as a new keypoint (midpoint)
-            ls = candidate[int(ls_idx)]
-            rs = candidate[int(rs_idx)]
-            neck_x = (ls[0] + rs[0]) / 2
-            neck_y = (ls[1] + rs[1]) / 2
-            neck_score = min(ls[2], rs[2])
-            neck_id = len(candidate)
-            candidate = np.vstack([candidate, [neck_x, neck_y, neck_score, neck_id]])
-            subset_op[i, 1] = neck_id  # neck is OpenPose joint 1
-
         # Copy score and count
-        subset_op[i, 18] = subset[i, 17]  # total score
-        subset_op[i, 19] = subset[i, 18]  # keypoint count
+        subset_op[i, 18] = subset[i, NUM_JOINTS]      # total score
+        subset_op[i, 19] = subset[i, NUM_JOINTS + 1]   # keypoint count
 
     return candidate, subset_op
 
@@ -334,10 +300,10 @@ class BodyHRNetPose:
 
     Returns:
         candidate: (N, 4) array of [x, y, score, id] for all detected keypoints.
-        subset: (M, 19) array where each row is a person:
-            - cols 0-16: keypoint index into candidate array (-1 if missing)
-            - col 17: sum of keypoint scores + connection scores
-            - col 18: number of detected keypoints
+        subset: (M, 20) array where each row is a person:
+            - cols 0-17: keypoint index into candidate array (-1 if missing)
+            - col 18: sum of keypoint scores + connection scores
+            - col 19: number of detected keypoints
 
     This format is compatible with util.draw_bodypose() and util.handDetect().
 
@@ -356,30 +322,25 @@ class BodyHRNetPose:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # Build and load model (dual-branch: PAF + heatmap)
-        self.model = HRNet(num_joints=NUM_COCO_JOINTS, num_limbs=NUM_COCO_LIMBS, width=width)
-        state = torch.load(model_path, map_location=self.device, weights_only=True)
+        self.model = HRNet(num_joints=NUM_JOINTS, num_limbs=NUM_LIMBS, width=width)
+        state = torch.load(model_path, map_location=self.device, weights_only=False)
         if isinstance(state, dict) and 'state_dict' in state:
             state = state['state_dict']
 
         # Handle legacy checkpoints with 'final_layer' instead of 'heatmap_head'/'paf_head'
-        if 'final_layer.weight' in state and 'heatmap_head.0.weight' not in state:
-            print(f"  Converting legacy checkpoint (final_layer -> heatmap_head + paf_head)")
-            final_weight = state.pop('final_layer.weight')  # (17, 32, 1, 1)
-            final_bias = state.pop('final_layer.bias')        # (17,)
-            num_joints_ckpt = final_bias.shape[0]  # 17
-            width_ckpt = final_weight.shape[1]     # 32
-
-            # Map final_layer -> heatmap_head (single conv1x1, no BN/ReLU in between)
-            # Legacy model: final_layer was a bare Conv2d(32, 17, 1)
-            # Current model: heatmap_head has Conv3x3->BN->ReLU->Conv1x1
-            # We can only load the final 1x1 conv; the first layers stay randomly initialized
-            # This is a partial migration - for best results, retrain with the new architecture
-            state['heatmap_head.3.weight'] = final_weight
-            state['heatmap_head.3.bias'] = final_bias
-
-            # PAF head doesn't exist in legacy checkpoint - leave it randomly initialized
-            print(f"  Warning: legacy checkpoint has no PAF head. PAF connections will be random.")
-            print(f"  For best results, use a checkpoint trained with the dual-branch architecture.")
+        # if 'final_layer.weight' in state and 'heatmap_head.0.weight' not in state:
+        #     print(f"  Converting legacy checkpoint (final_layer -> heatmap_head + paf_head)")
+        #     final_weight = state.pop('final_layer.weight')
+        #     final_bias = state.pop('final_layer.bias')
+        #
+        #     # Current head: Conv3x3->BN->ReLU->Conv3x3->BN->ReLU->Dropout->Conv3x3->BN->ReLU->Conv1x1
+        #     # Final Conv1x1 is at index 10
+        #     state['heatmap_head.10.weight'] = final_weight
+        #     state['heatmap_head.10.bias'] = final_bias
+        #
+        #     # PAF head doesn't exist in legacy checkpoint - leave it randomly initialized
+        #     print(f"  Warning: legacy checkpoint has no PAF head. PAF connections will be random.")
+        #     print(f"  For best results, use a checkpoint trained with the dual-branch architecture.")
 
         self.model.load_state_dict(state, strict=False)
         self.model.to(self.device).eval()
@@ -401,61 +362,36 @@ class BodyHRNetPose:
 
         Returns:
             candidate: (N, 4) array of [x, y, score, id].
-            subset: (M, 19) array of person data.
+            subset: (M, 20) array of person data.
         """
         h, w = oriImg.shape[0:2]
 
-        # ── Step 1: Multi-scale inference ──
-        heatmap_avg = np.zeros((h, w, NUM_COCO_JOINTS), dtype=np.float32)
-        paf_avg = np.zeros((h, w, NUM_COCO_LIMBS * 2), dtype=np.float32)
+        img = cv2.resize(oriImg, (self.input_size, self.input_size))
+        img = img.astype(np.float32) / 255.0
+        img = img.transpose(2, 0, 1)
+        img = torch.from_numpy(img).unsqueeze(0).float().to(self.device)
+        with torch.no_grad():
+            with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
+                paf_output, hm_output = self.model(img)
+        paf_np = paf_output.squeeze(0).cpu().numpy().transpose(1, 2, 0).astype(np.float32)  # (H, W, C)
+        heatmap_np = hm_output.squeeze(0).cpu().numpy().transpose(1, 2, 0).astype(np.float32)
 
-        for scale in self.scale_search:
-            # Resize image to scaled size
-            new_h = int(h * scale)
-            new_w = int(w * scale)
-            if new_h < 1 or new_w < 1:
-                continue
-            img_scaled = cv2.resize(oriImg, (new_w, new_h))
+        # 【可选】在64x64上做粗略阈值过滤
+        heatmap_np[heatmap_np < 0.05] = 0  # 提前过滤噪声
 
-            # Resize to model input size
-            img_input = cv2.resize(img_scaled, (self.input_size, self.input_size))
-
-            # ImageNet normalization
-            img_float = img_input.astype(np.float32) / 255.0
-            img_float = (img_float - IMAGENET_MEAN) / IMAGENET_STD
-            tensor = img_float.transpose(2, 0, 1)
-            data = torch.from_numpy(tensor).unsqueeze(0).float().to(self.device)
-
-            # Model forward pass (dual-branch: PAF + heatmap)
-            with torch.no_grad():
-                with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
-                    paf_output, hm_output = self.model(data)
-
-            # Model output already constrained: heatmap in [0,1], PAF in [-1,1]
-            paf_np = paf_output.squeeze(0).cpu().numpy().transpose(1, 2, 0).astype(np.float32)   # (H_hm, W_hm, 32)
-            heatmap_np = hm_output.squeeze(0).cpu().numpy().transpose(1, 2, 0).astype(np.float32)  # (H_hm, W_hm, 17)
-
-            # Resize to scaled image size, then to original size
-            paf_orig = cv2.resize(paf_np, (w, h), interpolation=cv2.INTER_CUBIC)
-            heatmap_orig = cv2.resize(heatmap_np, (w, h), interpolation=cv2.INTER_CUBIC)
-
-            # Accumulate across scales
-            heatmap_avg += heatmap_orig
-            paf_avg += paf_orig
-
-        # Average across scales
-        heatmap_avg /= len(self.scale_search)
-        paf_avg /= len(self.scale_search)
+        # Resize to scaled image size, then to original size
+        paf_output = cv2.resize(paf_np, (w, h), interpolation=cv2.INTER_CUBIC)
+        heatmap_output = cv2.resize(heatmap_np, (w, h), interpolation=cv2.INTER_CUBIC)
 
         # ── Debug: save heatmap visualization ──
-        save_dir = 'output/hrnet_body_pose'
+        save_dir = '../output/hrnet_body_pose'
         os.makedirs(save_dir, exist_ok=True)
-        heatmap_vis = visualize_heatmap(oriImg, heatmap_avg)
+        heatmap_vis = visualize_heatmap(oriImg, heatmap_output)
         cv2.imwrite(os.path.join(save_dir, 'heatmap_overlay.jpg'), heatmap_vis)
 
         # Save per-joint heatmaps
-        for part in range(NUM_COCO_JOINTS):
-            hm_single = heatmap_avg[:, :, part].astype(np.float32)
+        for part in range(NUM_JOINTS):
+            hm_single = heatmap_output[:, :, part].astype(np.float32)
             hm_norm = cv2.normalize(hm_single, None, 0, 255, cv2.NORM_MINMAX)
             hm_colored = cv2.applyColorMap(hm_norm.astype(np.uint8), cv2.COLORMAP_JET)
             blend = cv2.addWeighted(oriImg, 0.6, hm_colored, 0.4, 0)
@@ -466,8 +402,8 @@ class BodyHRNetPose:
         all_peaks = []
         peak_counter = 0
 
-        for part in range(NUM_COCO_JOINTS):
-            map_ori = heatmap_avg[:, :, part]
+        for part in range(NUM_JOINTS):
+            map_ori = heatmap_output[:, :, part]
             one_heatmap = gaussian_filter(map_ori, sigma=3)
 
             # Non-maximum suppression: compare with 4 neighbors
@@ -487,7 +423,9 @@ class BodyHRNetPose:
                 one_heatmap >= map_down,
                 one_heatmap > PEAK_THRESHOLD,
             ))
+            # 查找每个维度上非零（True）元素的索引（y,x）坐标，通过zip转换为（x,y）
             peaks = list(zip(np.nonzero(peaks_binary)[1], np.nonzero(peaks_binary)[0]))
+            #  map_ori 是NumPy数组，需要用 [行, 列] 即，(y,x)，将score加入到peaks，形成（x,y,score）
             peaks_with_score = [x + (map_ori[x[1], x[0]],) for x in peaks]
             peak_id = range(peak_counter, peak_counter + len(peaks))
             peaks_with_score_and_id = [peaks_with_score[i] + (peak_id[i],)
@@ -498,7 +436,7 @@ class BodyHRNetPose:
 
         # ── Step 3: PAF connection scoring ──
         connection_all = group_keypoints_by_paf(
-            all_peaks, paf_avg, (h, w)
+            all_peaks, paf_output, (h, w)
         )
 
         # ── Step 4: Person assembly ──

@@ -8,15 +8,22 @@ import os
 
 import numpy as np
 from tqdm import tqdm
+from utils.HRNetCocoDataset import HRNetCocoDataset
 
-from src.utils.CustomDataSet import CustomDataSet
 
-
-def preprocess_and_save(data_dir, split="train2017", output_dir="./preprocessed"):
+def preprocess_and_save(data_dir, split="train2017", output_dir="../preprocessed"):
     """Preprocess dataset and save ground truth tensors."""
     os.makedirs(output_dir, exist_ok=True)
 
-    dataset = CustomDataSet(data_dir, split)
+    dataset = HRNetCocoDataset(
+        data_dir,
+        split,
+        input_size=256,
+        heatmap_size=64,
+        sigma=1.0,
+        paf_sigma=2.0,
+        augment=True
+    )
     output_split_dir = os.path.join(output_dir, split)
     os.makedirs(output_split_dir, exist_ok=True)
 
@@ -33,13 +40,12 @@ def preprocess_and_save(data_dir, split="train2017", output_dir="./preprocessed"
 
         np.savez_compressed(save_path,
                             img_path=np.array(img_path.encode('utf-8')),
-                            paf=paf_t.numpy().astype(np.float16),
-                            hm=hm_t.numpy().astype(np.float16),
-                            mask=mask_t.numpy().astype(np.float16))
+                            paf=paf_t.numpy().astype(np.float32),
+                            hm=hm_t.numpy().astype(np.float32),
+                            mask=mask_t.numpy().astype(np.float32))
 
     print(f"Preprocessed data saved to {output_split_dir}")
 
 
 if __name__ == "__main__":
-    preprocess_and_save("./data", "val2017")
-    preprocess_and_save("./data", "train2017")
+    preprocess_and_save("../data", "train2017")

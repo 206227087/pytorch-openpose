@@ -29,8 +29,8 @@ from torch.utils.data import DataLoader
 
 from loss.hrnet_loss import HRNetLoss
 from models.hrnet_model import HRNet
-from src.config import NUM_JOINTS, NUM_LIMBS, NUM_PAF_CHANNELS
-from src.utils.HRNetCocoDataset import HRNetCocoDataset
+from config import NUM_JOINTS, NUM_LIMBS, NUM_PAF_CHANNELS
+from utils.HRNetCocoDataset import HRNetCocoDataset
 from utils.visualization_util import save_heatmap_comparison
 
 try:
@@ -109,16 +109,12 @@ def execute_train(model, optimizer, epoch, train_loader, criterion, train_args):
             paf_pred_mag_mean = torch.sqrt(paf_pred ** 2).mean().item()
             print(
                 f"  Step {step + 1:05d}/{len(train_loader):05d}  "
-                f"loss={loss.item() * train_args.accumulation_steps:.4f}  "
+                f"loss={loss.item() * train_args.accumulation_steps:.5f}  "
                 f"steps/s={steps_per_sec:.1f}  "
-                f"HM_gt_range=[{hm_gt_min:.4f}, {hm_gt_max:.4f}] "
-                f"HM_pred_range=[{hm_pred_min:.4f}, {hm_pred_max:.4f}] "
-                f"HM_gt_mag_mean={hm_gt_mag_mean:.4f} "
-                f"HM_mag_mean={hm_pred_mag_mean:.4f} "
-                f"PAF_gt_range=[{paf_gt_min:.4f}, {paf_gt_max:.4f}] "
-                f"PAF_pred_range=[{paf_pred_min:.4f}, {paf_pred_max:.4f}] "
-                f"PAF_gt_mean={paf_gt_mag_mean:.4f} "
-                f"PAF_pred_mag_mean={paf_pred_mag_mean:.4f} "
+                f"HM_range_gt/pred=[{hm_gt_min:.4f}, {hm_gt_max:.4f}]/[{hm_pred_min:.4f}, {hm_pred_max:.4f}] "
+                f"HM_mean_gt/pred={hm_gt_mag_mean:.4f}/{hm_pred_mag_mean:.4f} "
+                f"PAF_range_gt/pred=[{paf_gt_min:.4f}, {paf_gt_max:.4f}]/[{paf_pred_min:.4f}, {paf_pred_max:.4f}] "
+                f"PAF_mean_gt/pred={paf_gt_mag_mean:.4f}/{paf_pred_mag_mean:.4f} "
             )
             last_step_finished_time = now
     return train_loss / len(train_loader)
@@ -170,30 +166,44 @@ def do_train(args):
     else:
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr * 0.01)
 
+    # ReduceLROnPlateau: 在 warmup 完成后接管学习率调度
+    min_lr = args.lr * 0.01
+    reduce_lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5,
+        min_lr=min_lr
+    )
+
     if args.resume:
-        checkpoint = torch.load(args.resume, map_location=device)
+        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
 
         # 支持多种 checkpoint 格式
         if 'state_dict' in checkpoint:
             model.load_state_dict(checkpoint['state_dict'])
             print(f"Resumed from {args.resume}")
 
-            # 恢复 optimizer 和 scheduler 状态（如果有）
-            if 'optimizer' in checkpoint and hasattr(optimizer, 'load_state_dict'):
-                optimizer.load_state_dict(checkpoint['optimizer'])
-                print("  → Optimizer state restored")
+            start_epoch = 1
+            best_val = float("inf")
 
-            if 'scheduler' in checkpoint and hasattr(scheduler, 'load_state_dict'):
-                scheduler.load_state_dict(checkpoint['scheduler'])
-                print("  → Scheduler state restored")
+            if not args.resume_and_reset:
+                # 恢复 optimizer 和 scheduler 状态（如果有）
+                if 'optimizer' in checkpoint and hasattr(optimizer, 'load_state_dict'):
+                    optimizer.load_state_dict(checkpoint['optimizer'])
+                    print("  → Optimizer state restored")
 
-            # 恢复 best_val 和 epoch
-            start_epoch = checkpoint.get('epoch', 0) + 1
-            if 'best_val' in checkpoint:
-                best_val = checkpoint['best_val']
-                print(f"  → Best val loss: {best_val:.4f}")
-            else:
-                best_val = float("inf")
+                if 'scheduler' in checkpoint and hasattr(scheduler, 'load_state_dict'):
+                    scheduler.load_state_dict(checkpoint['scheduler'])
+                    print("  → Scheduler state restored")
+
+                if 'reduce_lr_scheduler' in checkpoint:
+                    reduce_lr_scheduler.load_state_dict(checkpoint['reduce_lr_scheduler'])
+                    print("  → ReduceLROnPlateau state restored")
+                # 恢复 best_val 和 epoch
+                start_epoch = checkpoint.get('epoch', 0) + 1
+                if 'best_val' in checkpoint:
+                    best_val = checkpoint['best_val']
+                    print(f"  → Best val loss: {best_val:.5f}")
+                else:
+                    best_val = float("inf")
         else:
             # 旧的格式，直接是 state_dict
             model.load_state_dict(checkpoint)
@@ -251,17 +261,9 @@ def do_train(args):
     os.makedirs(args.save_dir, exist_ok=True)
 
     # Early stopping 配置
-    patience = 20
+    patience = 10
     patience_counter = 0
     best_epoch = start_epoch - 1
-    min_lr = args.lr * 0.01
-
-    # ReduceLROnPlateau: 在 warmup 完成后接管学习率调度
-    # 监控 val loss，patience=5 个 epoch 无改善则降低 LR
-    reduce_lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5,
-        min_lr=min_lr
-    )
 
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_start = time.time()
@@ -285,10 +287,10 @@ def do_train(args):
             except Exception:
                 pass
 
-        # 学习率调度：warmup 阶段用 LambdaLR，warmup 结束后用 ReduceLROnPlateau
-        if epoch <= warmup_epochs:
-            scheduler.step()
-        else:
+        # 学习率调度：LambdaLR 始终调用（warmup + cosine annealing），
+        # warmup 结束后额外调用 ReduceLROnPlateau 做自适应衰减
+        scheduler.step()
+        if epoch > warmup_epochs:
             reduce_lr_scheduler.step(avg_val)
 
         current_lr = optimizer.param_groups[0]['lr']
@@ -296,7 +298,7 @@ def do_train(args):
         epoch_time = time.time() - epoch_start
         print(
             f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Epoch {epoch}/{args.epochs} end  "
-            f"train={avg_train:.4f}  val={avg_val:.4f}  "
+            f"train={avg_train:.5f}  val={avg_val:.5f}  "
             f"lr={current_lr:.2e}  "
             f"time={epoch_time:.1f}s"
         )
@@ -311,25 +313,26 @@ def do_train(args):
                 'state_dict': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'scheduler': scheduler.state_dict(),
+                'reduce_lr_scheduler': reduce_lr_scheduler.state_dict(),
                 'best_val': best_val,
                 'args': args,
             }, os.path.join(args.save_dir, "best.pth"))
-            print(f"  → New best model saved (val={best_val:.4f})")
+            print(f"  → New best model saved (val={best_val:.5f})")
         else:
             patience_counter += 1
-            print(f"  → No improvement for {patience_counter} epochs (best: {best_val:.4f} at epoch {best_epoch})")
+            print(f"  → No improvement for {patience_counter} epochs (best: {best_val:.5f} at epoch {best_epoch})")
 
             if patience_counter >= patience:
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print(f"  Early stopping triggered at epoch {epoch}")
-                print(f"  Best epoch: {best_epoch}, Best val loss: {best_val:.4f}")
-                print(f"{'='*60}\n")
+                print(f"  Best epoch: {best_epoch}, Best val loss: {best_val:.5f}")
+                print(f"{'=' * 60}\n")
                 break
 
         if epoch % args.save_every == 0:
             torch.save(
                 model.state_dict(),
-                os.path.join(args.save_dir, f"hrnet_w{args.width}_epoch{epoch:04d}_loss{avg_val:.4f}.pth")
+                os.path.join(args.save_dir, f"hrnet_w{args.width}_epoch{epoch:04d}_loss{avg_val:.5f}.pth")
             )
 
         if torch.cuda.is_available():
@@ -340,10 +343,10 @@ def do_train(args):
             writer.close()
         except Exception:
             pass
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Training complete.")
     print(f"Best epoch: {best_epoch}, Best val loss: {best_val:.4f}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
 
 if __name__ == "__main__":
@@ -392,6 +395,8 @@ if __name__ == "__main__":
                         help="Save checkpoint every N epochs (default: 1)")
     parser.add_argument("--resume", default=None,
                         help="Path to checkpoint to resume training from")
+    parser.add_argument("--resume_and_reset", default=False,
+                        help="Resume from checkpoint and reset train")
 
     # Debug
     parser.add_argument("--debug", action="store_true", default=False,
@@ -404,16 +409,21 @@ if __name__ == "__main__":
     args = parser.parse_args()
     # 以下列参数覆盖默认参数
     args.augment = True
-    args.sigma = 2.0
-    args.paf_sigma = 3.0
+    args.sigma = 1.0
+    args.paf_sigma = 2.0
     args.epochs = 150
     args.batch_size = 32
-    args.lr = 2e-4
+    args.accumulation_steps = 4
+    args.lr = 1e-4
     args.weight_decay = 1e-4
     args.warmup_epochs = 10
-    args.width = 32
-    args.resume = None
+    args.width = 48
+    args.resume = "../model/best_20260513_val0.03493.pth"
+    args.resume_and_reset = True
     args.debug = True
     args.debug_num_every_epoch = 5
+    # args.workers = 12
+    # args.log_dir = "/root/tf-logs/hrnet"
+    # args.data_dir = "/root/autodl-tmp/data"
 
     do_train(args)

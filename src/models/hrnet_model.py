@@ -230,20 +230,32 @@ class HRNet(nn.Module):
                 ))
 
         # Dual prediction heads from aggregated features
-        # Heatmap head: predicts num_joints channel heatmap
+        # Heatmap head: predicts num_joints channel heatmap (4 conv layers)
         self.heatmap_head = nn.Sequential(
             nn.Conv2d(width, width, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(width),
             nn.ReLU(inplace=True),
-            nn.Dropout2d(dropout),
-            nn.Conv2d(width, num_joints, kernel_size=1)
-        )
-        # PAF head: predicts num_limbs*2 channel part affinity fields
-        self.paf_head = nn.Sequential(
             nn.Conv2d(width, width, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(width),
             nn.ReLU(inplace=True),
             nn.Dropout2d(dropout),
+            nn.Conv2d(width, width, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(width),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(width, num_joints, kernel_size=1)
+        )
+        # PAF head: predicts num_limbs*2 channel part affinity fields (4 conv layers)
+        self.paf_head = nn.Sequential(
+            nn.Conv2d(width, width, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(width),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(width, width, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(width),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(width, width, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(width),
+            nn.ReLU(inplace=True),
             nn.Conv2d(width, num_paf_channels, kernel_size=1)
         )
 

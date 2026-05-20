@@ -15,23 +15,24 @@ import os
 import cv2
 import numpy as np
 import torch
+from numba.core.cgutils import printf
 from torch.utils.data import Dataset
-from src.config import NUM_JOINTS, NUM_PAF_CHANNELS, SKELETONS, NUM_LIMBS, KEYPOINT_FLIP_MAP
+from config import NUM_JOINTS, NUM_PAF_CHANNELS, SKELETONS, NUM_LIMBS, KEYPOINT_FLIP_MAP
 
 
-def make_heatmap(joints, size, sigma):
+def make_heatmap(joints, size, sigma, y_grid, x_grid):
     """Generate Gaussian heatmaps for 18 key points.
 
     Args:
         joints: list of (x, y, visibility) tuples.
         size: heatmap spatial size (e.g., 64 for 256x256 input with stride 4).
         sigma: Gaussian spread in heatmap-space pixels.
+        y_grid, x_grid: pre-computed meshgrid arrays.
 
     Returns:
         hm: (NUM_JOINTS, size, size) float32 array.
     """
     hm = np.zeros((NUM_JOINTS, size, size), dtype=np.float32)
-    y_grid, x_grid = np.mgrid[0:size, 0:size]
 
     for j_idx, (x, y, v) in enumerate(joints):
         if v == 0 or j_idx >= NUM_JOINTS:
@@ -42,13 +43,14 @@ def make_heatmap(joints, size, sigma):
     return hm
 
 
-def make_paf(joints, size, sigma):
+def make_paf(joints, size, sigma, y_grid, x_grid):
     """Generate Part Affinity Fields for NUM_LIMBS (18 limbs 36 channels).
 
     Args:
         joints: list of (x, y, visibility) tuples.
         size: PAF spatial size (e.g., 64).
         sigma: PAF limb width in heatmap-space pixels.
+        y_grid, x_grid: pre-computed meshgrid arrays.
 
     Returns:
         paf: (NUM_PAF_CHANNELS, size, size) float32 array.
@@ -56,7 +58,6 @@ def make_paf(joints, size, sigma):
     """
     paf = np.zeros((NUM_PAF_CHANNELS, size, size), dtype=np.float32)
     mask = np.zeros((NUM_PAF_CHANNELS, size, size), dtype=np.float32)
-    y_grid, x_grid = np.mgrid[0:size, 0:size]
 
     for limb_idx, (ja, jb) in enumerate(SKELETONS):
         if ja >= len(joints) or jb >= len(joints):
@@ -158,13 +159,15 @@ class HRNetCocoDataset(Dataset):
 
     def __init__(self, data_dir, split="train2017",
                  input_size=256, heatmap_size=64, sigma=2.0, paf_sigma=2.0,
-                 augment=True):
+                 augment=True, filter_key_points_nums=0):
         self.input_size = input_size
         self.heatmap_size = heatmap_size
         self.sigma = sigma
         self.paf_sigma = paf_sigma
         self.scale = heatmap_size / input_size
-        self.augment = augment and "train" in split
+        # TODO 测试代码待恢复
+        # self.augment = augment and "train" in split
+        self.augment = augment
 
         self.img_dir = os.path.join(data_dir, "images", split)
         ann_file = os.path.join(data_dir, "annotations",
@@ -179,7 +182,7 @@ class HRNetCocoDataset(Dataset):
         # Group annotations by image_id, filter out empty annotations
         self.samples = {}
         for ann in data["annotations"]:
-            if ann.get("num_keypoints", 0) == 0:
+            if ann.get("num_keypoints", 0) <= filter_key_points_nums:
                 continue
             iid = ann["image_id"]
             if iid not in self.samples:
@@ -189,7 +192,10 @@ class HRNetCocoDataset(Dataset):
         self.image_ids = sorted(self.samples.keys())
         print(f"Loaded {len(self.image_ids)} images with keypoints for {split}")
         if self.augment:
-            print(f"  Data augmentation enabled: random horizontal flip")
+            print(f"  Data augmentation enabled: random horizontal flip, scale, rotation, color jitter")
+
+        # Pre-compute mgrid for heatmap/PAF generation (size is fixed)
+        self.y_grid, self.x_grid = np.mgrid[0:heatmap_size, 0:heatmap_size]
 
     def __len__(self):
         return len(self.image_ids)
@@ -205,17 +211,20 @@ class HRNetCocoDataset(Dataset):
         Returns:
             Flipped joints list with left-right key point swapping.
         """
+        # Step 1: 先交换左右关键点的通道索引
+        # 例如：left_ankle (15) 和 right_ankle (16) 交换
+        swapped = [None] * len(joints)
+        for orig_idx, flip_idx in enumerate(KEYPOINT_FLIP_MAP):
+            swapped[orig_idx] = joints[flip_idx]
+
+        # Step 2: 再翻转 x 坐标
+        # 此时 swapped[15] 已经是原来的 right_ankle，翻转后变成新的 left_ankle
         flipped = []
-        for x, y, v in joints:
+        for x, y, v in swapped:
             new_x = width - 1 - x if v > 0 else x
             flipped.append((new_x, y, v))
 
-        # Swap left-right symmetric key points
-        swapped = [None] * len(flipped)
-        for orig_idx, flip_idx in enumerate(KEYPOINT_FLIP_MAP):
-            swapped[flip_idx] = flipped[orig_idx]
-
-        return swapped
+        return flipped
 
     def __getitem__(self, idx):
         iid = self.image_ids[idx]
@@ -242,6 +251,35 @@ class HRNetCocoDataset(Dataset):
         if do_flip:
             img = cv2.flip(img, 1)  # 1 = horizontal flip
 
+        # Data augmentation: scale, rotation, color jitter
+        scale_factor = 1.0
+        rotation_angle = 0.0
+        if self.augment:
+            # Random scale: [0.8, 1.2]
+            scale_factor = np.random.uniform(0.8, 1.2)
+            # Random rotation: [-15, 15] degrees
+            rotation_angle = np.random.uniform(-15, 15)
+
+            # Apply scale + rotation + center crop to input_size
+            if scale_factor != 1.0 or rotation_angle != 0.0:
+                center = (self.input_size / 2, self.input_size / 2)
+                M = cv2.getRotationMatrix2D(center, rotation_angle, scale_factor)
+                img = cv2.warpAffine(img, M, (self.input_size, self.input_size),
+                                     borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+            # Color jitter: brightness, contrast, saturation
+            if np.random.random() < 0.5:
+                # Convert to float for color ops
+                img_f = img.astype(np.float32)
+                # Brightness: [0.8, 1.2]
+                alpha = np.random.uniform(0.8, 1.2)
+                img_f *= alpha
+                # Contrast: [0.8, 1.2]
+                beta = np.random.uniform(0.8, 1.2)
+                mean = img_f.mean()
+                img_f = mean + beta * (img_f - mean)
+                img = np.clip(img_f, 0, 255).astype(np.uint8)
+
         # Normalize
         img_float = img.astype(np.float32) / 255.0
         img_tensor = torch.from_numpy(img_float.transpose(2, 0, 1))
@@ -261,16 +299,35 @@ class HRNetCocoDataset(Dataset):
             if do_flip:
                 joints = self._flip_joints(joints, self.input_size)
 
+            # Apply scale + rotation to joints
+            if scale_factor != 1.0 or rotation_angle != 0.0:
+                center = self.input_size / 2
+                angle_rad = np.radians(rotation_angle)
+                cos_a = np.cos(angle_rad) * scale_factor
+                sin_a = np.sin(angle_rad) * scale_factor
+                new_joints = []
+                for x, y, v in joints:
+                    if v > 0:
+                        dx, dy = x - center, y - center
+                        nx = cos_a * dx + sin_a * dy + center
+                        ny = -sin_a * dx + cos_a * dy + center
+                        nx = min(max(nx, 0), self.input_size - 1)
+                        ny = min(max(ny, 0), self.input_size - 1)
+                        new_joints.append((nx, ny, v))
+                    else:
+                        new_joints.append((x, y, v))
+                joints = new_joints
+
             # Scale joint coordinates to heatmap space
             scaled = [(x * self.scale, y * self.scale, v) for x, y, v in joints]
 
             # Heatmap: element-wise max across persons
-            hm = make_heatmap(scaled, self.heatmap_size, self.sigma)
+            hm = make_heatmap(scaled, self.heatmap_size, self.sigma, self.y_grid, self.x_grid)
 
             np.maximum(hm_agg, hm, out=hm_agg)
 
             # PAF: for overlapping limbs, keep the one with larger magnitude
-            paf, pmask = make_paf(scaled, self.heatmap_size, self.paf_sigma)
+            paf, pmask = make_paf(scaled, self.heatmap_size, self.paf_sigma, self.y_grid, self.x_grid)
 
             for limb_idx in range(NUM_LIMBS):
                 paf_limb_mag = np.sqrt(paf[limb_idx * 2] ** 2 + paf[limb_idx * 2 + 1] ** 2)

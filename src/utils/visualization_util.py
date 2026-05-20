@@ -9,7 +9,7 @@ import os
 import cv2
 import numpy as np
 
-from src.config import NUM_JOINTS, SKELETONS, JOINT_NAMES
+from config import NUM_JOINTS, SKELETONS, JOINT_NAMES
 
 # Build joint-to-limbs mapping: for each joint, find all connected limbs
 # joint_to_limbs[joint_idx] = [(limb_idx, is_start_point), ...]

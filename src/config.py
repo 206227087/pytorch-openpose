@@ -55,7 +55,7 @@ PAF_SIGMA = 1.0  # PAF limb width (in heatmap-space pixels)
 
 # ─── Inference Parameters ─────────────────────────────────────────────────────
 SCALE_SEARCH = [0.5, 1.0, 1.5, 2.0]
-PEAK_THRESHOLD = 0.1  # heatmap peak detection threshold
+PEAK_THRESHOLD = 0.15  # heatmap peak detection threshold
 PAF_SCORE_THRESHOLD = 0.05  # minimum average PAF score for a valid connection
 MID_NUM = 10  # number of sample points along each PAF for scoring
 

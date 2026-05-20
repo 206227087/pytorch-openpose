@@ -1,24 +1,25 @@
 """HRNet multi-person body pose estimation demo.
 
 Demonstrates single-image and real-time multi-person pose estimation using
-the HRNet backbone with PAF+heatmap dual-branch output. Also shows model
-profiling and comparison with OpenPose.
+the HRNet backbone with PAF+heatmap dual-branch output.
 
 Usage:
-  python demo_hrnet.py image --image images/demo.jpg --model model/hrnet_w32.pth
+  python demo_hrnet.py image --image images/demo.jpg --model checkpoints/best.pth
   python demo_hrnet.py profile
-  python demo_hrnet.py realtime --model model/hrnet_w32.pth
+  python demo_hrnet.py realtime --model checkpoints/best.pth
 """
 
 import argparse
+import os
+import time
 
 import cv2
 import matplotlib.pyplot as plt
 import torch
 
-from src.hrnet_body_pose import BodyHRNetPose, convert_to_openpose_format
-from src.inference import profile_model
-from src.models.hrnet_model import HRNet
+import util
+from hrnet_body_pose import BodyHRNetPose
+from models.hrnet_model import HRNet
 
 
 def demo_image(image_path, model_path, width=32, input_size=256):
@@ -29,14 +30,22 @@ def demo_image(image_path, model_path, width=32, input_size=256):
     if oriImg is None:
         raise FileNotFoundError(f"Cannot read image: {image_path}")
 
+
     candidate, subset = body(oriImg)
 
-    # Convert to OpenPose format for drawing
-    candidate_op, subset_op = convert_to_openpose_format(candidate.copy(), subset)
+    # oriImg = cv2.resize(oriImg, (1080, 1080),
+    #                     interpolation=cv2.INTER_LINEAR)
 
-    # Draw using util.draw_bodypose
-    from src import util
-    canvas = util.draw_bodypose(oriImg, candidate_op, subset_op)
+    # Convert to OpenPose format for drawing
+    # candidate_op, subset_op = convert_to_openpose_format(candidate.copy(), subset)
+    canvas = util.draw_bodypose(oriImg, candidate, subset)
+
+    # Save result
+    save_dir = '../output/demo'
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, os.path.basename(image_path))
+    cv2.imwrite(save_path, canvas)
+    print(f"Result saved to {save_path}")
 
     # Display
     plt.figure(figsize=(12, 6))
@@ -61,44 +70,43 @@ def demo_image(image_path, model_path, width=32, input_size=256):
 
 
 def demo_profile(width=32, input_size=256):
-    """Profile HRNet model speed and compare with OpenPose."""
+    """Profile HRNet model speed."""
+    from src.config import NUM_JOINTS, NUM_LIMBS
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # Profile HRNet-W32
     print(f"--- HRNet-W{width} Profiling ---")
-    hrnet = HRNet(num_joints=17, num_limbs=16, width=width).to(device).eval()
-    stats = profile_model(hrnet, input_shape=(1, 3, input_size, input_size),
-                          device=device)
-    print(f"  Parameters: {stats['params_M']:.2f}M")
-    print(f"  Avg inference: {stats['avg_ms']:.1f} ms")
-    print(f"  FPS: {stats['fps']:.1f}")
-    if stats['gpu_mem_MB'] > 0:
-        print(f"  GPU memory: {stats['gpu_mem_MB']:.0f} MB")
+    hrnet = HRNet(num_joints=NUM_JOINTS, num_limbs=NUM_LIMBS, width=width).to(device).eval()
 
-    # Profile OpenPose for comparison
-    print(f"\n--- OpenPose Profiling ---")
-    from src.models.hrnet_model import bodypose_model
-    openpose = bodypose_model().to(device).eval()
-    stats_op = profile_model(openpose, input_shape=(1, 3, 368, 368),
-                             device=device)
-    print(f"  Parameters: {stats_op['params_M']:.2f}M")
-    print(f"  Avg inference: {stats_op['avg_ms']:.1f} ms")
-    print(f"  FPS: {stats_op['fps']:.1f}")
-    if stats_op['gpu_mem_MB'] > 0:
-        print(f"  GPU memory: {stats_op['gpu_mem_MB']:.0f} MB")
+    # Parameter count
+    params_M = sum(p.numel() for p in hrnet.parameters()) / 1e6
+    print(f"  Parameters: {params_M:.2f}M")
 
-    # Comparison
-    print(f"\n--- Comparison ---")
-    speedup = stats_op['avg_ms'] / stats['avg_ms']
-    param_ratio = stats_op['params_M'] / stats['params_M']
-    print(f"  HRNet is {speedup:.1f}x {'faster' if speedup > 1 else 'slower'} than OpenPose")
-    print(f"  HRNet has {param_ratio:.1f}x the parameters of OpenPose")
+    # Inference speed benchmark
+    dummy = torch.randn(1, 3, input_size, input_size, device=device)
+    # Warmup
+    for _ in range(10):
+        with torch.no_grad():
+            hrnet(dummy)
+    if device == 'cuda':
+        torch.cuda.synchronize()
+    # Benchmark
+    n_runs = 50
+    t0 = time.time()
+    for _ in range(n_runs):
+        with torch.no_grad():
+            hrnet(dummy)
+    if device == 'cuda':
+        torch.cuda.synchronize()
+    avg_ms = (time.time() - t0) / n_runs * 1000
+    print(f"  Avg inference: {avg_ms:.1f} ms")
+    print(f"  FPS: {1000 / avg_ms:.1f}")
+    if device == 'cuda':
+        print(f"  GPU memory: {torch.cuda.max_memory_allocated() / 1e6:.0f} MB")
 
 
 def demo_realtime(model_path, source=0, width=32, input_size=256):
     """Run real-time HRNet multi-person pose estimation on video/camera."""
     body = BodyHRNetPose(model_path, width=width, input_size=input_size)
-    from src import util
 
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
@@ -110,10 +118,16 @@ def demo_realtime(model_path, source=0, width=32, input_size=256):
         if not ret:
             break
 
+        t0 = time.time()
         candidate, subset = body(frame)
-        candidate_op, subset_op = convert_to_openpose_format(candidate.copy(), subset)
-        canvas = util.draw_bodypose(frame, candidate_op, subset_op)
+        fps = 1.0 / (time.time() - t0 + 1e-6)
 
+        # candidate_op, subset_op = convert_to_openpose_format(candidate.copy(), subset)
+        # canvas = util.draw_bodypose(frame, candidate_op, subset_op)
+        canvas = util.draw_bodypose(frame, candidate, subset)
+
+        cv2.putText(canvas, f'FPS: {fps:.1f}', (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         cv2.imshow('HRNet Multi-Person Pose', canvas)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
@@ -128,9 +142,9 @@ if __name__ == '__main__':
 
     # Image demo
     img_parser = sub.add_parser('image', help='Run on a single image')
-    img_parser.add_argument('--image', default='images/demo.jpg', help='Input image path')
-    img_parser.add_argument('--model', default='checkpoints/hrnet_w48_epoch0005_loss0.1607.pth', help='HRNet model weights')
-    img_parser.add_argument('--width', type=int, default=48, help='HRNet width (32 or 48)')
+    img_parser.add_argument('--image', default='../images/demo.jpg', help='Input image path')
+    img_parser.add_argument('--model', default='../checkpoints/best.pth', help='HRNet model weights')
+    img_parser.add_argument('--width', type=int, default=32, help='HRNet width (32 or 48)')
     img_parser.add_argument('--input_size', type=int, default=256)
 
     # Profile demo
@@ -140,7 +154,7 @@ if __name__ == '__main__':
 
     # Realtime demo
     rt_parser = sub.add_parser('realtime', help='Real-time camera demo')
-    rt_parser.add_argument('--model', default='model/hrnet_w32.pth')
+    rt_parser.add_argument('--model', default='../checkpoints/best.pth')
     rt_parser.add_argument('--source', default=0, type=int, help='Camera index or video file path')
     rt_parser.add_argument('--width', type=int, default=32)
     rt_parser.add_argument('--input_size', type=int, default=256)
@@ -149,11 +163,10 @@ if __name__ == '__main__':
     # 如果没有提供任何子命令，默认使用 image 并设置所有必需参数
     if args.command is None:
         args.command = 'image'
-        args.image = 'images/000000033221.jpg'
-        args.model = 'checkpoints/hrnet_w32_epoch0013_loss0.0716.pth'
-        args.width = 32
+        args.image = '../images/000000025393.jpg'
+        args.model = '../model/best_20260513_val0.03493.pth'
+        args.width = 48
         args.input_size = 256
-
 
     if args.command == 'image':
         demo_image(args.image, args.model, args.width, args.input_size)
