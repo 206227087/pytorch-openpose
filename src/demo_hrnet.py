@@ -164,7 +164,8 @@ if __name__ == '__main__':
     if args.command is None:
         args.command = 'image'
         args.image = '../images/000000025393.jpg'
-        args.model = '../model/best_20260513_val0.03493.pth'
+        args.model = '../model/hrnet_w48_epoch0116_loss-2.25737.pth'
+        # args.model = '../checkpoints/hrnet_w48_epoch0056_loss0.15806.pth'
         args.width = 48
         args.input_size = 256
 

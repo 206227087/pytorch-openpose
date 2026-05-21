@@ -20,273 +20,147 @@ import os
 import cv2
 import numpy as np
 import torch
-from scipy.ndimage import gaussian_filter
-from src.config import NUM_JOINTS,NUM_LIMBS,SKELETONS
+from scipy.ndimage import gaussian_filter, maximum_filter
+
+from src.config import NUM_JOINTS, NUM_LIMBS, SKELETONS, JOINT_NAMES
 from src.models.hrnet_model import HRNet
 
+PEAK_THRESHOLD = 0.25  # Heatmap peak detection threshold
+MIN_KEYPOINTS = 8  # Minimum keypoints per person
+MIN_DIST_THRESHOLD = 15.0  # Distance threshold for peak merging
+HEATMAP_FILTER = 0.5
+GAUSSIAN_FILTER_SIGMA = 4
+PAF_FILTER_THRESHOLD = 0.5
 
-# ─── COCO-to-OpenPose Joint Mapping ──────────────────────────────────────────
-# Maps COCO 17-joint indices to OpenPose 18-joint indices for compatibility
-# with util.draw_bodypose() and util.handDetect().
-# OpenPose joints: 0:nose 1:neck 2:r_shoulder 3:r_elbow 4:r_wrist
-#                  5:l_shoulder 6:l_elbow 7:l_wrist 8:r_hip 9:r_knee
-#                 10:r_ankle 11:l_hip 12:l_knee 13:l_ankle
-#                 14:r_eye 15:l_eye 16:r_ear 17:l_ear
-COCO_TO_OPENPOSE = {
-    0: 0,   # nose -> nose
-    1: 15,  # left_eye -> l_eye
-    2: 14,  # right_eye -> r_eye
-    3: 17,  # left_ear -> l_ear
-    4: 16,  # right_ear -> r_ear
-    5: 5,   # left_shoulder -> l_shoulder
-    6: 2,   # right_shoulder -> r_shoulder
-    7: 6,   # left_elbow -> l_elbow
-    8: 3,   # right_elbow -> r_elbow
-    9: 7,   # left_wrist -> l_wrist
-    10: 4,  # right_wrist -> r_wrist
-    11: 11, # left_hip -> l_hip
-    12: 8,  # right_hip -> r_hip
-    13: 12, # left_knee -> l_knee
-    14: 9,  # right_knee -> r_knee
-    15: 13, # left_ankle -> l_ankle
-    16: 10, # right_ankle -> r_ankle
-    17: 1,  # neck -> neck
-}
-
-# ─── Inference Parameters ─────────────────────────────────────────────────────
-INPUT_SIZE = 256          # HRNet input image size
-HEATMAP_SIZE = 64         # Output heatmap size (stride = 4)
-STRIDE = INPUT_SIZE // HEATMAP_SIZE
-
-SCALE_SEARCH = [0.5, 1.0, 1.5, 2.0]  # Multi-scale inference scales
-PEAK_THRESHOLD = 0.1                  # Heatmap peak detection threshold
-MIN_KEYPOINTS = 3                     # Minimum keypoints per person
-MIN_AVG_CONF = 0.2                    # Minimum average confidence per person
-
-
-# ─── Visualization Helpers ────────────────────────────────────────────────────
-
-def visualize_heatmap(oriImg, heatmap_avg):
-    """Overlay heatmap on original image for debugging."""
-    vis_img = oriImg.copy().astype(np.float64)
-    alpha = 0.4
-    colors = [
-        [255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0], [255, 0, 255],
-        [0, 255, 255], [128, 0, 0], [0, 128, 0], [0, 0, 128],
-        [128, 128, 0], [128, 0, 128], [0, 128, 128],
-        [64, 64, 64], [192, 192, 192], [128, 64, 0], [64, 128, 0], [0, 64, 128],
-    ]
-
-    for part in range(heatmap_avg.shape[2]):
-        heatmap = heatmap_avg[:, :, part]
-        heatmap_normalized = cv2.normalize(heatmap, None, 0, 255, cv2.NORM_MINMAX)
-        heatmap_colored = np.zeros((oriImg.shape[0], oriImg.shape[1], 3), dtype=np.uint8)
-        color = colors[part % len(colors)]
-        for i in range(3):
-            heatmap_colored[:, :, i] = heatmap_normalized.astype(np.uint8) * color[i] / 255.0
-        mask = heatmap_normalized > 50
-        vis_img[mask] = vis_img[mask] * (1 - alpha) + heatmap_colored[mask] * alpha
-
-    return vis_img.astype(np.uint8)
-
-
-# ─── Multi-Person Grouping (skeleton-based, no PAF) ───────────────────────────
-
-def group_keypoints_by_paf(all_peaks, paf_avg, oriImg_shape, mid_num=10,
-                            paf_score_threshold=0.05):
-    """Group detected keypoints into persons using PAF connection scoring.
-
-    Same algorithm as body.py's PAF scoring: for each limb, integrate
-    the PAF along the line segment between candidate keypoint pairs,
-    then greedily assign the highest-scoring connections.
-
-    Args:
-        all_peaks: list of 17 lists, each containing (x, y, score, id) tuples.
-        paf_avg: (H, W, 32) PAF array resized to original image size.
-        oriImg_shape: (height, width) of original image.
-        mid_num: number of sample points along each PAF for scoring (default 10).
-        paf_score_threshold: minimum average PAF score for a valid connection.
-
-    Returns:
-        connection_all: list of connection arrays for each limb.
-    """
-    connection_all = []
+def group_keypoints_by_paf(all_peaks, paf_avg, oriImg_shape, mid_num=10):
+    """Compute PAF scores for all possible limb connections."""
+    connection_links = []  # Stores: (limb_idx, score, id_a, id_b, x1, y1, x2, y2)
 
     for limb_idx, (indexA, indexB) in enumerate(SKELETONS):
         candA = all_peaks[indexA]
         candB = all_peaks[indexB]
-        nA = len(candA)
-        nB = len(candB)
+        if not candA or not candB: continue
 
-        if nA == 0 or nB == 0:
-            connection_all.append(np.zeros((0, 5)))
-            continue
+        paf_x = paf_avg[:, :, limb_idx * 2]
+        paf_y = paf_avg[:, :, limb_idx * 2 + 1]
+        h, w = oriImg_shape
 
-        connection_candidate = []
-
-        for i in range(nA):
-            for j in range(nB):
-                x1, y1, scoreA = candA[i][0], candA[i][1], candA[i][2]
-                x2, y2, scoreB = candB[j][0], candB[j][1], candB[j][2]
-
-                dx = x2 - x1
-                dy = y2 - y1
+        for i, (x1, y1, scoreA, idA) in enumerate(candA):
+            for j, (x2, y2, scoreB, idB) in enumerate(candB):
+                dx, dy = x2 - x1, y2 - y1
                 dist = math.sqrt(dx ** 2 + dy ** 2)
-                if dist < 1e-6:
-                    continue
+                if dist < 1e-6: continue
 
-                # Unit vector along the limb
-                ux = dx / dist
-                uy = dy / dist
-
-                # Sample points along the PAF and compute line integral
-                paf_x = paf_avg[:, :, limb_idx * 2]
-                paf_y = paf_avg[:, :, limb_idx * 2 + 1]
-
-                score = 0.0 # 沿连线方向采样
+                ux, uy = dx / dist, dy / dist
+                paf_score = 0.0
                 for t in range(mid_num):
                     frac = t / mid_num
-                    sx = int(round(x1 + frac * dx))
-                    sy = int(round(y1 + frac * dy))
-                    sx = min(max(sx, 0), oriImg_shape[1] - 1)
-                    sy = min(max(sy, 0), oriImg_shape[0] - 1)
-                    score += paf_x[sy, sx] * ux + paf_y[sy, sx] * uy    # 向量点积
+                    sx = min(max(int(round(x1 + frac * dx)), 0), w - 1)
+                    sy = min(max(int(round(y1 + frac * dy)), 0), h - 1)
+                    paf_score += paf_x[sy, sx] * ux + paf_y[sy, sx] * uy
+                paf_score /= mid_num
 
-                score /= mid_num
+                if paf_score > PAF_FILTER_THRESHOLD:
+                    connection_links.append((limb_idx, paf_score, idA, idB, x1, y1, x2, y2))
 
-                # Filter by threshold
-                if score < paf_score_threshold:
-                    continue
-
-                connection_candidate.append([i, j, score])
-
-        # Greedy assignment: sort by score, assign each keypoint at most once
-        connection_candidate = sorted(connection_candidate, key=lambda x: x[2], reverse=True)
-        connection = np.zeros((0, 5))
-        for c in range(len(connection_candidate)):  # connection结构：col 0: 关节A的关键点ID（全局ID ）col 1: 关节B的关键点ID（全局ID）col 2: PAF连接得分 col 3: 关节A的关键点置信度 col 4: 关节B的关键点置信度
-            i, j, s = connection_candidate[c][0:3]  # 提取关节点索引和paf得分
-            if i not in connection[:, 0] and j not in connection[:, 1]:
-                connection = np.vstack([
-                    connection,
-                    [candA[i][3], candB[j][3], s, candA[i][2], candB[j][2]]
-                ])
-            if len(connection) >= min(nA, nB):
-                break
-
-        connection_all.append(connection)
-
-    return connection_all
+    # Sort by PAF score descending for greedy assembly
+    return sorted(connection_links, key=lambda x: x[1], reverse=True)
 
 
-def assemble_persons(all_peaks, connection_all):
-    """Assemble persons from limb connections.
+def assemble_persons_simple(all_peaks, connection_links):
+    """Greedy assembly using dictionary objects for better debugging."""
+    persons = []  # List of dicts: {'joints': {joint_idx: global_id}, 'score': float}
+    point_to_person = {}  # Map global_id -> person_index
 
-    Follows the same logic as body.py's person assembly:
-    - For each connection (partA, partB):
-      Case 1: One existing person contains partA or partB -> add connection
-      Case 2: Two different persons -> merge if no conflict
-      Case 3: Neither found -> create new person
+    # 记录每个人身上的连线历史，用于重组决策：{person_idx: [(id_a, id_b, score), ...]}
+    person_links = []
 
-    Returns (candidate, subset) in the same format as body.py:
-      candidate: (N, 4) array of [x, y, score, id]
-      subset: (M, 19) array - first 17 cols are keypoint IDs, col 17 is
-              total score, col 18 is keypoint count
-    """
-    # subset: NUM_JOINTS keypoint slots + score + count
-    num_cols = NUM_JOINTS + 2
-    subset = -1 * np.ones((0, num_cols))
-    candidate = np.array([item for sublist in all_peaks for item in sublist])
+    # 按 PAF 得分从高到低排序，优先处理可信度高的连线
+    for limb_idx, paf_score, idA, idB, x1, y1, x2, y2 in connection_links:
+        idxA, idxB = SKELETONS[limb_idx]
+        if limb_idx == 10:
+            print(f"8->10:({x1},{y1})->({x2},{y2})，score:{paf_score}")
+        # print(f"线段index:{limb_idx:02d},{JOINT_NAMES[idxA]}->{JOINT_NAMES[idxB]}")
+        # 查找这两个点目前属于谁
+        p_a = point_to_person.get(idA)
+        p_b = point_to_person.get(idB)
 
-    for k in range(NUM_LIMBS):
-        if k >= len(connection_all) or len(connection_all[k]) == 0:
-            continue
+        # 获取当前点的自身置信度（用于辅助决策）
+        # all_peaks 结构：all_peaks[joint_idx] = [(x, y, score, global_id), ...]
+        score_a = next((p[2] for p in all_peaks[idxA] if p[3] == idA), 0)
+        score_b = next((p[2] for p in all_peaks[idxB] if p[3] == idB), 0)
+        current_link_quality = paf_score + score_a + score_b
 
-        indexA, indexB = SKELETONS[k]
-        partAs = connection_all[k][:, 0]
-        partBs = connection_all[k][:, 1]
+        # 情况 1：两个点都已经属于某个人了
+        if p_a is not None and p_b is not None:
+            if p_a == p_b: continue  # Already in same person
 
-        for i in range(len(connection_all[k])):
-            found = 0
-            subset_idx = [-1, -1]
-            for j in range(len(subset)):
-                if subset[j][indexA] == partAs[i] or subset[j][indexB] == partBs[i]:
-                    if found < 2:
-                        subset_idx[found] = j
-                        found += 1
-                    else:
-                        break
+            # 【优化】：比较“合并后的预期质量”或“当前连线对双方的贡献”
+            # 简单做法：谁拥有的该关节置信度低，或者谁当前总质量低，就合并到另一方
+            # 但最稳妥的仍是：优先保留 PAF 积分高的那条骨架路径
 
-            if found == 1:
-                j = subset_idx[0]
-                if subset[j][indexB] != partBs[i]:
-                    subset[j][indexB] = partBs[i]
-                    subset[j][-1] += 1  # keypoint count
-                    subset[j][-2] += candidate[partBs[i].astype(int), 2] + connection_all[k][i][2]  # score
-            elif found == 2:
-                j1, j2 = subset_idx
-                membership = ((subset[j1] >= 0).astype(int) + (subset[j2] >= 0).astype(int))[:-2]
-                if len(np.nonzero(membership == 2)[0]) == 0:
-                    subset[j1][:-2] += (subset[j2][:-2] + 1)
-                    subset[j1][-2:] += subset[j2][-2:]
-                    subset[j1][-2] += connection_all[k][i][2]
-                    subset = np.delete(subset, j2, 0)
-                else:
-                    subset[j1][indexB] = partBs[i]
-                    subset[j1][-1] += 1
-                    subset[j1][-2] += candidate[partBs[i].astype(int), 2] + connection_all[k][i][2]
-            elif not found:
-                row = -1 * np.ones(num_cols)
-                row[indexA] = partAs[i]
-                row[indexB] = partBs[i]
-                row[-1] = 2  # keypoint count
-                row[-2] = sum(candidate[connection_all[k][i, :2].astype(int), 2]) + connection_all[k][i][2]
-                subset = np.vstack([subset, row])
+            # 【修正】双向冲突检测：检查所有共同关节索引是否指向不同的点
+            common = set(persons[p_a]['joints'].keys()) & set(persons[p_b]['joints'].keys())
+            conflict = any(persons[p_a]['joints'][j] != persons[p_b]['joints'][j] for j in common)
+            if not conflict:
+                # 将小的/质量差的合并到大的/质量好的
+                if persons[p_a]['score'] < persons[p_b]['score']:
+                    p_a, p_b = p_b, p_a  # 确保 p_a 是较大的那个
 
-    # Filter invalid persons
-    delete_idx = []
-    for i in range(len(subset)):
-        if subset[i][-1] < MIN_KEYPOINTS or subset[i][-2] / subset[i][-1] < MIN_AVG_CONF:
-            delete_idx.append(i)
-    subset = np.delete(subset, delete_idx, axis=0)
+                persons[p_a]['joints'].update(persons[p_b]['joints'])
+                persons[p_a]['score'] += persons[p_b]['score'] + current_link_quality
+                for pid in persons[p_b]['joints'].values(): point_to_person[pid] = p_a
+                persons[p_b] = None
+        # 情况 2：只有 idA 属于某人，尝试把 idB 加进去
+        elif p_a is not None:
+            if idxB not in persons[p_a]['joints']:
+                persons[p_a]['joints'][idxB] = idB
+                persons[p_a]['score'] += current_link_quality
+                point_to_person[idB] = p_a
+                # print(f"{idA}->{idB}，{idA}所属已有人物{p_a},添加{idB}")
+        # 情况 3：只有 idB 属于某人，尝试把 idA 加进去
+        elif p_b is not None:
+            if idxA not in persons[p_b]['joints']:
+                persons[p_b]['joints'][idxA] = idA
+                persons[p_b]['score'] += current_link_quality
+                point_to_person[idA] = p_b
+                # print(f"{idA}->{idB}，{idB}所属已有人物{p_b},添加{idA}")
+        # 情况 4：两个点都是新的，创建一个新的人
+        else:
+            # Create new person
+            new_person = {'joints': {idxA: idA, idxB: idB}, 'score': current_link_quality}
+            # 新元素的index索引位置
+            person_index = len(persons)
+            point_to_person[idA] = person_index
+            point_to_person[idB] = person_index
+            persons.append(new_person)
+            # print(f"{idA}->{idB}所属新增人物{person_index}")
 
-    return candidate, subset
+    # 清理被标记合并的旧对象，并过滤掉关键点太少的人
+    persons = [p for p in persons if p is not None and len(p['joints']) >= MIN_KEYPOINTS]
+    return persons
 
 
-# ─── Format Conversion ────────────────────────────────────────────────────────
+def persons_to_candidate_subset(persons, all_peaks):
+    """Convert simplified objects back to OpenPose (candidate, subset) format."""
+    candidate = []
+    id_map = {}  # old_id -> new_candidate_idx
+    for part_peaks in all_peaks:
+        for p in part_peaks:
+            id_map[p[3]] = len(candidate)
+            candidate.append([p[0], p[1], p[2], p[3]])
+    candidate = np.array(candidate)
 
-def convert_to_openpose_format(candidate, subset):
-    """Convert 18-joint (candidate, subset) to OpenPose 18-joint format.
+    subset = []
+    for p in persons:
+        row = -1 * np.ones(NUM_JOINTS + 2)
+        for j_idx, global_id in p['joints'].items():
+            row[j_idx] = id_map.get(global_id, -1)
+            row[-2] += candidate[int(row[j_idx]), 2] if row[j_idx] != -1 else 0
+            row[-1] += 1
+        subset.append(row)
 
-    Training uses 18 joints (COCO 17 + neck), so neck is already at index 17.
-    This function reorders to OpenPose's joint ordering (neck at index 1).
-
-    Args:
-        candidate: (N, 4) array of [x, y, score, id] from BodyHRNetPose.
-        subset: (M, 20) array from BodyHRNetPose (18 joints + score + count).
-
-    Returns:
-        candidate: same candidate array (keypoints are unchanged).
-        subset_op: (M, 20) array in OpenPose format:
-            - cols 0-17: keypoint indices (18 OpenPose joints)
-            - col 18: total score
-            - col 19: keypoint count
-    """
-    if len(subset) == 0:
-        return candidate, -1 * np.ones((0, 20))
-
-    subset_op = -1 * np.ones((len(subset), 20))
-
-    for i in range(len(subset)):
-        # Map joint positions to OpenPose ordering
-        for coco_idx, openpose_idx in COCO_TO_OPENPOSE.items():
-            if coco_idx < NUM_JOINTS:
-                subset_op[i, openpose_idx] = subset[i, coco_idx]
-
-        # Copy score and count
-        subset_op[i, 18] = subset[i, NUM_JOINTS]      # total score
-        subset_op[i, 19] = subset[i, NUM_JOINTS + 1]   # keypoint count
-
-    return candidate, subset_op
+    return candidate, np.array(subset) if subset else np.zeros((0, NUM_JOINTS + 2))
 
 
 # ─── BodyHRNetPose Class ─────────────────────────────────────────────────────
@@ -311,14 +185,11 @@ class BodyHRNetPose:
         model_path: path to HRNet weights file.
         width: HRNet width (32 for W32, 48 for W48).
         input_size: model input image size (default 256).
-        scale_search: list of scales for multi-scale inference.
     """
 
-    def __init__(self, model_path, width=32, input_size=256,
-                 scale_search=None):
+    def __init__(self, model_path, width=32, input_size=256):
         self.input_size = input_size
         self.width = width
-        self.scale_search = scale_search or SCALE_SEARCH
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # Build and load model (dual-branch: PAF + heatmap)
@@ -326,21 +197,6 @@ class BodyHRNetPose:
         state = torch.load(model_path, map_location=self.device, weights_only=False)
         if isinstance(state, dict) and 'state_dict' in state:
             state = state['state_dict']
-
-        # Handle legacy checkpoints with 'final_layer' instead of 'heatmap_head'/'paf_head'
-        # if 'final_layer.weight' in state and 'heatmap_head.0.weight' not in state:
-        #     print(f"  Converting legacy checkpoint (final_layer -> heatmap_head + paf_head)")
-        #     final_weight = state.pop('final_layer.weight')
-        #     final_bias = state.pop('final_layer.bias')
-        #
-        #     # Current head: Conv3x3->BN->ReLU->Conv3x3->BN->ReLU->Dropout->Conv3x3->BN->ReLU->Conv1x1
-        #     # Final Conv1x1 is at index 10
-        #     state['heatmap_head.10.weight'] = final_weight
-        #     state['heatmap_head.10.bias'] = final_bias
-        #
-        #     # PAF head doesn't exist in legacy checkpoint - leave it randomly initialized
-        #     print(f"  Warning: legacy checkpoint has no PAF head. PAF connections will be random.")
-        #     print(f"  For best results, use a checkpoint trained with the dual-branch architecture.")
 
         self.model.load_state_dict(state, strict=False)
         self.model.to(self.device).eval()
@@ -366,8 +222,7 @@ class BodyHRNetPose:
         """
         h, w = oriImg.shape[0:2]
 
-        img = cv2.resize(oriImg, (self.input_size, self.input_size))
-        img = img.astype(np.float32) / 255.0
+        img = cv2.resize(oriImg, (self.input_size, self.input_size)).astype(np.float32) / 255
         img = img.transpose(2, 0, 1)
         img = torch.from_numpy(img).unsqueeze(0).float().to(self.device)
         with torch.no_grad():
@@ -377,17 +232,11 @@ class BodyHRNetPose:
         heatmap_np = hm_output.squeeze(0).cpu().numpy().transpose(1, 2, 0).astype(np.float32)
 
         # 【可选】在64x64上做粗略阈值过滤
-        heatmap_np[heatmap_np < 0.05] = 0  # 提前过滤噪声
+        heatmap_np[heatmap_np < HEATMAP_FILTER] = 0  # 提前过滤噪声
 
         # Resize to scaled image size, then to original size
         paf_output = cv2.resize(paf_np, (w, h), interpolation=cv2.INTER_CUBIC)
         heatmap_output = cv2.resize(heatmap_np, (w, h), interpolation=cv2.INTER_CUBIC)
-
-        # ── Debug: save heatmap visualization ──
-        save_dir = '../output/hrnet_body_pose'
-        os.makedirs(save_dir, exist_ok=True)
-        heatmap_vis = visualize_heatmap(oriImg, heatmap_output)
-        cv2.imwrite(os.path.join(save_dir, 'heatmap_overlay.jpg'), heatmap_vis)
 
         # Save per-joint heatmaps
         for part in range(NUM_JOINTS):
@@ -395,51 +244,46 @@ class BodyHRNetPose:
             hm_norm = cv2.normalize(hm_single, None, 0, 255, cv2.NORM_MINMAX)
             hm_colored = cv2.applyColorMap(hm_norm.astype(np.uint8), cv2.COLORMAP_JET)
             blend = cv2.addWeighted(oriImg, 0.6, hm_colored, 0.4, 0)
-            cv2.imwrite(os.path.join(save_dir, f'heatmap_joint_{part:02d}.jpg'), blend)
+            cv2.imwrite(os.path.join('../output/hrnet_body_pose', f'heatmap_joint_{part:02d}.jpg'), blend)
 
-        # ── Step 2: Peak detection ──
-        # Same logic as body.py: Gaussian smooth + NMS
+        # Step 1: Peak Detection with Distance Merging
         all_peaks = []
         peak_counter = 0
-
         for part in range(NUM_JOINTS):
             map_ori = heatmap_output[:, :, part]
-            one_heatmap = gaussian_filter(map_ori, sigma=3)
+            one_heatmap = gaussian_filter(map_ori, sigma=GAUSSIAN_FILTER_SIGMA)
 
-            # Non-maximum suppression: compare with 4 neighbors
-            map_left = np.zeros(one_heatmap.shape)
-            map_left[1:, :] = one_heatmap[:-1, :]
-            map_right = np.zeros(one_heatmap.shape)
-            map_right[:-1, :] = one_heatmap[1:, :]
-            map_up = np.zeros(one_heatmap.shape)
-            map_up[:, 1:] = one_heatmap[:, :-1]
-            map_down = np.zeros(one_heatmap.shape)
-            map_down[:, :-1] = one_heatmap[:, 1:]
+            # 替代手动的 4-neighbor 比较
+            neighborhood = np.ones((7, 7))  # 7x7 窗口 NMS
+            local_max = maximum_filter(one_heatmap, footprint=neighborhood) == one_heatmap
+            mask = local_max & (one_heatmap > PEAK_THRESHOLD)
 
-            peaks_binary = np.logical_and.reduce((
-                one_heatmap >= map_left,
-                one_heatmap >= map_right,
-                one_heatmap >= map_up,
-                one_heatmap >= map_down,
-                one_heatmap > PEAK_THRESHOLD,
-            ))
             # 查找每个维度上非零（True）元素的索引（y,x）坐标，通过zip转换为（x,y）
-            peaks = list(zip(np.nonzero(peaks_binary)[1], np.nonzero(peaks_binary)[0]))
+            peaks = list(zip(np.nonzero(mask)[1], np.nonzero(mask)[0]))
             #  map_ori 是NumPy数组，需要用 [行, 列] 即，(y,x)，将score加入到peaks，形成（x,y,score）
             peaks_with_score = [x + (map_ori[x[1], x[0]],) for x in peaks]
-            peak_id = range(peak_counter, peak_counter + len(peaks))
-            peaks_with_score_and_id = [peaks_with_score[i] + (peak_id[i],)
-                                       for i in range(len(peak_id))]
 
-            all_peaks.append(peaks_with_score_and_id)
-            peak_counter += len(peaks)
+            # Distance-based deduplication
+            valid_peaks = []
+            for p in peaks_with_score:
+                is_dup = False
+                for i, kept in enumerate(valid_peaks):
+                    if math.hypot(p[0] - kept[0], p[1] - kept[1]) < MIN_DIST_THRESHOLD:
+                        if p[2] > kept[2]: valid_peaks[i] = p
+                        is_dup = True;
+                        break
+                if not is_dup: valid_peaks.append(p)
 
-        # ── Step 3: PAF connection scoring ──
-        connection_all = group_keypoints_by_paf(
-            all_peaks, paf_output, (h, w)
-        )
+            # 为当前关节的点分配 ID 并加入 all_peaks
+            current_part_peaks = []
+            for p in valid_peaks:
+                x, y, score = p
+                current_part_peaks.append((x, y, score, peak_counter))
+                peak_counter += 1
+            all_peaks.append(current_part_peaks)  # all_peaks[part] 存储该关节的所有点
 
-        # ── Step 4: Person assembly ──
-        candidate, subset = assemble_persons(all_peaks, connection_all)
+        # Step 2 & 3: PAF Scoring & Greedy Assembly
+        links = group_keypoints_by_paf(all_peaks, paf_output, (h, w))
+        persons = assemble_persons_simple(all_peaks, links)
 
-        return candidate, subset
+        return persons_to_candidate_subset(persons, all_peaks)

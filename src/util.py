@@ -38,7 +38,7 @@ def draw_bodypose(canvas, candidate, subset):
             mY = np.mean(Y)
             length = ((X[0] - X[1]) ** 2 + (Y[0] - Y[1]) ** 2) ** 0.5
             angle = math.degrees(math.atan2(Y[0] - Y[1], X[0] - X[1]))
-            stickwidth = 2
+            stickwidth = 1
             polygon = cv2.ellipse2Poly(
                 (int(mX), int(mY)), (int(length / 2), stickwidth),
                 int(angle), 0, 360, 1)
@@ -49,7 +49,7 @@ def draw_bodypose(canvas, candidate, subset):
             if joint == -1:
                 continue
             x, y = candidate[joint][:2]
-            cv2.circle(canvas, (int(x), int(y)), 3, person_color, thickness=2)
-            cv2.putText(canvas, str(idx), (int(x), int(y)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, person_color, 2)
+            cv2.circle(canvas, (int(x), int(y)), 2, person_color, thickness=1)
+            # cv2.putText(canvas, str(idx), (int(x), int(y)),
+            #             cv2.FONT_HERSHEY_SIMPLEX, 0.8, person_color, 2)
     return canvas

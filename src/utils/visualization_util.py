@@ -12,7 +12,6 @@ import numpy as np
 from config import NUM_JOINTS, SKELETONS, JOINT_NAMES
 
 # Build joint-to-limbs mapping: for each joint, find all connected limbs
-# joint_to_limbs[joint_idx] = [(limb_idx, is_start_point), ...]
 joint_to_limbs = {}
 for joint_idx in range(NUM_JOINTS):
     joint_to_limbs[joint_idx] = []
@@ -51,7 +50,7 @@ def save_heatmap_comparison(img, hm_pred, hm_gt, paf_pred, paf_gt, epoch, step, 
         gt_hm = cv2.resize(gt_hm, (img_vis.shape[1], img_vis.shape[0]), interpolation=cv2.INTER_CUBIC)
         gt_hm = cv2.normalize(gt_hm, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         gt_hm = cv2.applyColorMap(gt_hm, cv2.COLORMAP_JET)
-        gt_blend = cv2.addWeighted(img_vis, 0.5, gt_hm, 0.5, 0)
+        gt_blend = cv2.addWeighted(img_vis, 0.6, gt_hm, 0.4, 0)
         cv2.putText(gt_blend, f'GT-HM-{joint_name}', (10, 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
 
@@ -59,7 +58,7 @@ def save_heatmap_comparison(img, hm_pred, hm_gt, paf_pred, paf_gt, epoch, step, 
         pred_hm = cv2.resize(pred_hm, (img_vis.shape[1], img_vis.shape[0]), interpolation=cv2.INTER_CUBIC)
         pred_hm = cv2.normalize(pred_hm, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         pred_hm = cv2.applyColorMap(pred_hm, cv2.COLORMAP_JET)
-        pred_blend = cv2.addWeighted(img_vis, 0.5, pred_hm, 0.5, 0)
+        pred_blend = cv2.addWeighted(img_vis, 0.6, pred_hm, 0.4, 0)
         cv2.putText(pred_blend, f'PRED-GM-{joint_name}', (10, 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
 
@@ -76,12 +75,13 @@ def save_heatmap_comparison(img, hm_pred, hm_gt, paf_pred, paf_gt, epoch, step, 
         gt_mag_agg = np.zeros((img_vis.shape[0], img_vis.shape[1]), dtype=np.float32)
         pred_mag_agg = np.zeros((img_vis.shape[0], img_vis.shape[1]), dtype=np.float32)
 
-        for limb_idx, is_start in connected_limbs:
+        for limb_idx,_ in connected_limbs:
             # GT PAF magnitude for this limb
             gt_px = paf_gt[limb_idx * 2]
             gt_py = paf_gt[limb_idx * 2 + 1]
             gt_mag = np.sqrt(gt_px ** 2 + gt_py ** 2).astype(np.float32)
-            gt_mag_resized = cv2.resize(gt_mag, (img_vis.shape[1], img_vis.shape[0]), interpolation=cv2.INTER_CUBIC)
+            gt_mag_resized = cv2.resize(gt_mag, (img_vis.shape[1], img_vis.shape[0]),
+                                        interpolation=cv2.INTER_CUBIC)
             gt_mag_agg = np.maximum(gt_mag_agg, gt_mag_resized)  # Take max across limbs
 
             # Pred PAF magnitude for this limb
@@ -97,13 +97,13 @@ def save_heatmap_comparison(img, hm_pred, hm_gt, paf_pred, paf_gt, epoch, step, 
         # Normalize and visualize aggregated PAF
         gt_norm = cv2.normalize(gt_mag_agg, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         gt_norm = cv2.applyColorMap(gt_norm, cv2.COLORMAP_JET)
-        gt_blend = cv2.addWeighted(img_vis, 0.5, gt_norm, 0.5, 0)
+        gt_blend = cv2.addWeighted(img_vis, 0.6, gt_norm, 0.4, 0)
         cv2.putText(gt_blend, f'GT-PAF-{joint_name}', (10, 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
 
         pred_norm = cv2.normalize(pred_mag_agg, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         pred_norm = cv2.applyColorMap(pred_norm, cv2.COLORMAP_JET)
-        pred_blend = cv2.addWeighted(img_vis, 0.5, pred_norm, 0.5, 0)
+        pred_blend = cv2.addWeighted(img_vis, 0.6, pred_norm, 0.4, 0)
         cv2.putText(pred_blend, f'PRED-PAF-{joint_name}', (10, 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
 

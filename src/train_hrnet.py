@@ -26,6 +26,7 @@ import numpy as np
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from loss.hrnet_loss import HRNetLoss
 from models.hrnet_model import HRNet
@@ -51,9 +52,8 @@ def execute_train(model, optimizer, epoch, train_loader, criterion, train_args):
     train_loss = 0.0
     optimizer.zero_grad(set_to_none=True)
 
-    last_step_finished_time = time.time()
-
-    for step, (imgs, paf_gt, hm_gt, paf_mask) in enumerate(train_loader):
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch} [Train]", dynamic_ncols=True)
+    for step, (imgs, paf_gt, hm_gt, paf_mask) in enumerate(pbar):
         imgs = imgs.to(device)
         paf_gt = paf_gt.to(device)
         hm_gt = hm_gt.to(device)
@@ -91,32 +91,37 @@ def execute_train(model, optimizer, epoch, train_loader, criterion, train_args):
                     step=step + 1,
                     save_dir=train_args.debug_output_dir
                 )
-            now = time.time()
-            step_time = now - last_step_finished_time
-            steps_per_sec = max(1, len(train_loader) // 5) / step_time
 
-            hm_gt_max = hm_gt.max().item()
-            hm_gt_min = hm_gt.min().item()
             hm_gt_mag_mean = torch.sqrt(hm_gt ** 2).mean().item()
-            hm_pred_max = hm_pred.max().item()
-            hm_pred_min = hm_pred.min().item()
             hm_pred_mag_mean = torch.sqrt(hm_pred ** 2).mean().item()
-            paf_gt_max = paf_gt.max().item()
-            paf_gt_min = paf_gt.min().item()
             paf_gt_mag_mean = torch.sqrt(paf_gt ** 2).mean().item()
-            paf_pred_max = paf_pred.max().item()
-            paf_pred_min = paf_pred.min().item()
             paf_pred_mag_mean = torch.sqrt(paf_pred ** 2).mean().item()
+
+            # 计算 Heatmap 相似度
+            hm_cosine_sim = torch.nn.functional.cosine_similarity(
+                hm_pred.flatten(start_dim=1),
+                hm_gt.flatten(start_dim=1)
+            ).mean().item()
+
+            # 计算 PAF 相似度
+            paf_cosine_sim = torch.nn.functional.cosine_similarity(
+                paf_pred.flatten(start_dim=1),
+                paf_gt.flatten(start_dim=1)
+            ).mean().item()
+
+            # 计算 MSE
+            hm_mse = torch.mean((hm_pred - hm_gt) ** 2).item()
+            paf_mse = torch.mean((paf_pred - paf_gt) ** 2).item()
             print(
-                f"  Step {step + 1:05d}/{len(train_loader):05d}  "
-                f"loss={loss.item() * train_args.accumulation_steps:.5f}  "
-                f"steps/s={steps_per_sec:.1f}  "
-                f"HM_range_gt/pred=[{hm_gt_min:.4f}, {hm_gt_max:.4f}]/[{hm_pred_min:.4f}, {hm_pred_max:.4f}] "
+                f"  loss={loss.item() * train_args.accumulation_steps:.5f}  "
                 f"HM_mean_gt/pred={hm_gt_mag_mean:.4f}/{hm_pred_mag_mean:.4f} "
-                f"PAF_range_gt/pred=[{paf_gt_min:.4f}, {paf_gt_max:.4f}]/[{paf_pred_min:.4f}, {paf_pred_max:.4f}] "
+                f"HM_cos_sim={hm_cosine_sim:.4f} "
+                f"HM_MSE={hm_mse:.6f}  "
                 f"PAF_mean_gt/pred={paf_gt_mag_mean:.4f}/{paf_pred_mag_mean:.4f} "
+                f"PAF_cos_sim={paf_cosine_sim:.4f} "
+                f"PAF_MSE={paf_mse:.6f}"
             )
-            last_step_finished_time = now
+    pbar.close()
     return train_loss / len(train_loader)
 
 
@@ -150,8 +155,14 @@ def do_train(args):
     print(f"  Output: PAF {NUM_PAF_CHANNELS}-ch + Heatmap {NUM_JOINTS}-ch")
 
     # Loss, optimizer, scheduler
-    criterion = HRNetLoss()
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    criterion = HRNetLoss().to(device)
+    # optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # 👇 修改：将模型参数和 Loss 函数参数合并
+    optimizer = optim.Adam(
+        list(model.parameters()) + list(criterion.parameters()),
+        lr=args.lr,
+        weight_decay=args.weight_decay
+    )
 
     # Cosine annealing with warmup (standard for HRNet)
     warmup_epochs = args.warmup_epochs
@@ -185,15 +196,19 @@ def do_train(args):
             best_val = float("inf")
 
             if not args.resume_and_reset:
-                # 恢复 optimizer 和 scheduler 状态（如果有）
+                # 恢复 criterion 状态
+                if 'criterion_state_dict' in checkpoint:
+                    criterion.load_state_dict(checkpoint['criterion_state_dict'])
+                    print("  → Criterion (Loss weights) state restored")
+                # 恢复 optimizer 状态
                 if 'optimizer' in checkpoint and hasattr(optimizer, 'load_state_dict'):
                     optimizer.load_state_dict(checkpoint['optimizer'])
                     print("  → Optimizer state restored")
-
+                # 恢复 scheduler 状态
                 if 'scheduler' in checkpoint and hasattr(scheduler, 'load_state_dict'):
                     scheduler.load_state_dict(checkpoint['scheduler'])
                     print("  → Scheduler state restored")
-
+                # 恢复 ReduceLROnPlateau 状态
                 if 'reduce_lr_scheduler' in checkpoint:
                     reduce_lr_scheduler.load_state_dict(checkpoint['reduce_lr_scheduler'])
                     print("  → ReduceLROnPlateau state restored")
@@ -227,7 +242,8 @@ def do_train(args):
         heatmap_size=args.heatmap_size,
         sigma=args.sigma,
         paf_sigma=args.paf_sigma,
-        augment=args.augment
+        augment=args.augment,
+        filter_key_points_nums=args.filter_key_points_nums
     )
     val_ds = HRNetCocoDataset(
         args.data_dir, split="val2017",
@@ -272,18 +288,24 @@ def do_train(args):
         # ── Train ──
         avg_train = execute_train(model, optimizer, epoch, train_loader, criterion, args)
 
+        # ── Validate ──
+        avg_val = execute_validate(model, val_loader, criterion)
+
         if writer is not None:
             try:
                 writer.add_scalar("loss/train", avg_train, epoch)
-                writer.add_scalar("lr", optimizer.param_groups[0]['lr'], epoch)
-            except Exception:
-                pass
-
-        # ── Validate ──
-        avg_val = execute_validate(model, val_loader, criterion)
-        if writer is not None:
-            try:
                 writer.add_scalar("loss/val", avg_val, epoch)
+                writer.add_scalar("lr", optimizer.param_groups[0]['lr'], epoch)
+
+                # 记录不确定性加权参数
+                # 记录 log_sigma 原始值
+                writer.add_scalar("uncertainty/log_sigma_paf", criterion.log_sigma_paf.item(), epoch)
+                writer.add_scalar("uncertainty/log_sigma_hm", criterion.log_sigma_hm.item(), epoch)
+
+                # 记录实际生效的 Loss 权重 exp(-log_sigma)
+                # 这个值越大约表示模型认为该任务越难，给予的权重越高
+                writer.add_scalar("uncertainty/weight_paf", torch.exp(-criterion.log_sigma_paf).item(), epoch)
+                writer.add_scalar("uncertainty/weight_hm", torch.exp(-criterion.log_sigma_hm).item(), epoch)
             except Exception:
                 pass
 
@@ -311,6 +333,7 @@ def do_train(args):
             torch.save({
                 'epoch': epoch,
                 'state_dict': model.state_dict(),
+                'criterion_state_dict': criterion.state_dict(),  # 新增：保存 Loss 参数
                 'optimizer': optimizer.state_dict(),
                 'scheduler': scheduler.state_dict(),
                 'reduce_lr_scheduler': reduce_lr_scheduler.state_dict(),
@@ -365,6 +388,8 @@ if __name__ == "__main__":
                         help="Gaussian sigma for heatmap generation (default: 2.0)")
     parser.add_argument("--paf_sigma", type=float, default=3.0,
                         help="PAF limb width in heatmap-space pixels (default: 3.0)")
+    parser.add_argument("--filter_key_points_nums", type=int, default=10,
+                        help="Drop key point num less then")
 
     # Model
     parser.add_argument("--width", type=int, default=32,
@@ -410,18 +435,19 @@ if __name__ == "__main__":
     # 以下列参数覆盖默认参数
     args.augment = True
     args.sigma = 1.0
-    args.paf_sigma = 2.0
-    args.epochs = 150
+    args.paf_sigma = 1.0
+    args.epochs = 120
     args.batch_size = 32
-    args.accumulation_steps = 4
-    args.lr = 1e-4
+    args.accumulation_steps = 16
+    args.lr = 5e-4
     args.weight_decay = 1e-4
-    args.warmup_epochs = 10
+    args.warmup_epochs = 15
     args.width = 48
-    args.resume = "../model/best_20260513_val0.03493.pth"
-    args.resume_and_reset = True
+    args.resume = "../checkpoints/best.pth"
+    args.resume_and_reset = False
     args.debug = True
     args.debug_num_every_epoch = 5
+    args.filter_key_points_nums = 10
     # args.workers = 12
     # args.log_dir = "/root/tf-logs/hrnet"
     # args.data_dir = "/root/autodl-tmp/data"

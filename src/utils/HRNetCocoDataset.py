@@ -15,7 +15,6 @@ import os
 import cv2
 import numpy as np
 import torch
-from numba.core.cgutils import printf
 from torch.utils.data import Dataset
 from config import NUM_JOINTS, NUM_PAF_CHANNELS, SKELETONS, NUM_LIMBS, KEYPOINT_FLIP_MAP
 
@@ -165,8 +164,6 @@ class HRNetCocoDataset(Dataset):
         self.sigma = sigma
         self.paf_sigma = paf_sigma
         self.scale = heatmap_size / input_size
-        # TODO 测试代码待恢复
-        # self.augment = augment and "train" in split
         self.augment = augment
 
         self.img_dir = os.path.join(data_dir, "images", split)
