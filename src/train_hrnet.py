@@ -28,9 +28,9 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from config import NUM_JOINTS, NUM_LIMBS, NUM_PAF_CHANNELS
 from loss.hrnet_loss import HRNetLoss
 from models.hrnet_model import HRNet
-from config import NUM_JOINTS, NUM_LIMBS, NUM_PAF_CHANNELS
 from utils.HRNetCocoDataset import HRNetCocoDataset
 from utils.visualization_util import save_heatmap_comparison
 
@@ -97,29 +97,12 @@ def execute_train(model, optimizer, epoch, train_loader, criterion, train_args):
             paf_gt_mag_mean = torch.sqrt(paf_gt ** 2).mean().item()
             paf_pred_mag_mean = torch.sqrt(paf_pred ** 2).mean().item()
 
-            # 计算 Heatmap 相似度
-            hm_cosine_sim = torch.nn.functional.cosine_similarity(
-                hm_pred.flatten(start_dim=1),
-                hm_gt.flatten(start_dim=1)
-            ).mean().item()
-
-            # 计算 PAF 相似度
-            paf_cosine_sim = torch.nn.functional.cosine_similarity(
-                paf_pred.flatten(start_dim=1),
-                paf_gt.flatten(start_dim=1)
-            ).mean().item()
-
-            # 计算 MSE
-            hm_mse = torch.mean((hm_pred - hm_gt) ** 2).item()
-            paf_mse = torch.mean((paf_pred - paf_gt) ** 2).item()
             print(
                 f"  loss={loss.item() * train_args.accumulation_steps:.5f}  "
                 f"HM_mean_gt/pred={hm_gt_mag_mean:.4f}/{hm_pred_mag_mean:.4f} "
-                f"HM_cos_sim={hm_cosine_sim:.4f} "
-                f"HM_MSE={hm_mse:.6f}  "
+                f"HM_loss={criterion.log_sigma_hm.item():.4f}  "
                 f"PAF_mean_gt/pred={paf_gt_mag_mean:.4f}/{paf_pred_mag_mean:.4f} "
-                f"PAF_cos_sim={paf_cosine_sim:.4f} "
-                f"PAF_MSE={paf_mse:.6f}"
+                f"PAF_loss={criterion.log_sigma_paf.item():.4f}"
             )
     pbar.close()
     return train_loss / len(train_loader)
@@ -156,7 +139,6 @@ def do_train(args):
 
     # Loss, optimizer, scheduler
     criterion = HRNetLoss().to(device)
-    # optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     # 👇 修改：将模型参数和 Loss 函数参数合并
     optimizer = optim.Adam(
         list(model.parameters()) + list(criterion.parameters()),
@@ -295,7 +277,6 @@ def do_train(args):
             try:
                 writer.add_scalar("loss/train", avg_train, epoch)
                 writer.add_scalar("loss/val", avg_val, epoch)
-                writer.add_scalar("lr", optimizer.param_groups[0]['lr'], epoch)
 
                 # 记录不确定性加权参数
                 # 记录 log_sigma 原始值
@@ -306,6 +287,9 @@ def do_train(args):
                 # 这个值越大约表示模型认为该任务越难，给予的权重越高
                 writer.add_scalar("uncertainty/weight_paf", torch.exp(-criterion.log_sigma_paf).item(), epoch)
                 writer.add_scalar("uncertainty/weight_hm", torch.exp(-criterion.log_sigma_hm).item(), epoch)
+
+                # 记录学习率
+                writer.add_scalar("lr", optimizer.param_groups[0]['lr'], epoch)
             except Exception:
                 pass
 
@@ -436,18 +420,18 @@ if __name__ == "__main__":
     args.augment = True
     args.sigma = 1.0
     args.paf_sigma = 1.0
-    args.epochs = 120
-    args.batch_size = 32
-    args.accumulation_steps = 16
-    args.lr = 5e-4
+    args.epochs = 180
+    args.batch_size = 64
+    args.accumulation_steps = 4
+    args.lr = 1e-4
     args.weight_decay = 1e-4
     args.warmup_epochs = 15
     args.width = 48
-    args.resume = "../checkpoints/best.pth"
-    args.resume_and_reset = False
+    # args.resume = "../checkpoints/best.pth"
+    # args.resume_and_reset = False
     args.debug = True
     args.debug_num_every_epoch = 5
-    args.filter_key_points_nums = 10
+    args.filter_key_points_nums = -1
     # args.workers = 12
     # args.log_dir = "/root/tf-logs/hrnet"
     # args.data_dir = "/root/autodl-tmp/data"

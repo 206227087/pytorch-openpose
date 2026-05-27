@@ -163,9 +163,9 @@ if __name__ == '__main__':
     # 如果没有提供任何子命令，默认使用 image 并设置所有必需参数
     if args.command is None:
         args.command = 'image'
-        args.image = '../images/000000025393.jpg'
-        args.model = '../model/hrnet_w48_epoch0116_loss-2.25737.pth'
-        # args.model = '../checkpoints/hrnet_w48_epoch0056_loss0.15806.pth'
+        args.image = '../images/demo.jpg'
+        # args.model = '../model/hrnet_w48_epoch0116_loss-2.25737.pth'
+        args.model = '../checkpoints/best.pth'
         args.width = 48
         args.input_size = 256
 
