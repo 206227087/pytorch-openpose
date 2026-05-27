@@ -60,7 +60,7 @@ PAF_SCORE_THRESHOLD = 0.05  # minimum average PAF score for a valid connection
 MID_NUM = 10  # number of sample points along each PAF for scoring
 
 # ─── Model Output Channels ────────────────────────────────────────────────────
-NUM_HEATMAP_CHANNELS = NUM_JOINTS + 1  # 19 (18 joints + background)
+NUM_HEATMAP_CHANNELS = NUM_JOINTS  # (18 joints)
 
 # ─── DEBUG Config ─────────────────────────────────────────────────────────────
 DEBUG = True
